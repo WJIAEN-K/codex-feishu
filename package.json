@@ -1,12 +1,14 @@
 {
   "name": "codex-feishu",
   "version": "0.1.0",
-  "description": "Control Codex Agent through a Feishu or Lark bot using WebSocket long connections",
+  "description": "Control OpenAI Codex through a Feishu or Lark bot using WebSocket long connections",
   "type": "module",
   "main": "dist/index.js",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/WJIAEN-K/codex-feishu.git"
+  "types": "dist/index.d.ts",
+  "bin": {
+    "codex-feishu": "dist/index.js"
   },
-  "homepage": "https://github.com
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE
