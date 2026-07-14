@@ -4,6 +4,7 @@ import type { FeishuConfig } from "../types.js";
 
 export interface AppConfig {
   feishu: FeishuConfig;
+  adminOpenIds: string[];
   codex: {
     command: string;
     args: string[];
@@ -11,6 +12,7 @@ export interface AppConfig {
     model?: string;
     reasoningEffort?: string;
     requestTimeoutMs: number;
+    allowedRoots: string[];
   };
   sessionDatabasePath: string;
   logLevel: "debug" | "info" | "warn" | "error";
@@ -29,6 +31,22 @@ function positiveInteger(name: string, fallback: number): number {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function commaSeparated(name: string): string[] {
+  return (optional(name) ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function absolutePaths(name: string, fallback: string[]): string[] {
+  const values = commaSeparated(name);
+  const paths = values.length > 0 ? values : fallback;
+  for (const path of paths) {
+    if (!isAbsolute(path)) throw new Error(`${name} must contain only absolute paths`);
+  }
+  return [...new Set(paths.map((path) => resolve(path)))];
 }
 
 export function loadConfig(): AppConfig {
@@ -56,6 +74,7 @@ export function loadConfig(): AppConfig {
       encryptKey: optional("FEISHU_ENCRYPT_KEY"),
       verificationToken: optional("FEISHU_VERIFICATION_TOKEN"),
     },
+    adminOpenIds: commaSeparated("FEISHU_ADMIN_OPEN_IDS"),
     codex: {
       command: optional("CODEX_COMMAND") ?? "codex",
       args: ["app-server", "--stdio"],
@@ -63,6 +82,7 @@ export function loadConfig(): AppConfig {
       model: optional("CODEX_MODEL"),
       reasoningEffort: optional("CODEX_REASONING_EFFORT"),
       requestTimeoutMs: positiveInteger("CODEX_REQUEST_TIMEOUT_MS", 120_000),
+      allowedRoots: absolutePaths("CODEX_ALLOWED_ROOTS", [workingDirectory]),
     },
     sessionDatabasePath: resolve(
       optional("CODEX_SESSION_DB_PATH") ?? join(process.cwd(), ".codex-feishu", "sessions.sqlite"),

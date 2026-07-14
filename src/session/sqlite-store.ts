@@ -3,13 +3,14 @@ import { dirname } from "node:path";
 
 import Database from "better-sqlite3";
 
-import type { ChatSession, SessionStatus } from "../types.js";
+import type { ChatSession, SessionBindingMode, SessionStatus } from "../types.js";
 import type { SessionStore } from "./store.js";
 
 interface SessionRow {
   chat_id: string;
   thread_id: string;
   cwd: string;
+  binding_mode: SessionBindingMode;
   status: SessionStatus;
   active_turn_id: string | null;
   created_at: number;
@@ -19,6 +20,7 @@ interface SessionRow {
 export class SqliteSessionStore implements SessionStore {
   private readonly database: Database.Database;
   private readonly selectSession: Database.Statement<[string], SessionRow>;
+  private readonly selectSessionByThread: Database.Statement<[string], SessionRow>;
   private readonly upsertSession: Database.Statement;
   private readonly deleteSession: Database.Statement<[string]>;
 
@@ -32,24 +34,36 @@ export class SqliteSessionStore implements SessionStore {
         chat_id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL,
         cwd TEXT NOT NULL,
+        binding_mode TEXT NOT NULL DEFAULT 'owned' CHECK (binding_mode IN ('owned', 'attached')),
         status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'waiting_approval', 'error')),
         active_turn_id TEXT,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )
     `);
+    const columns = this.database.prepare("PRAGMA table_info(chat_sessions)").all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "binding_mode")) {
+      this.database.exec(
+        "ALTER TABLE chat_sessions ADD COLUMN binding_mode TEXT NOT NULL DEFAULT 'owned' " +
+        "CHECK (binding_mode IN ('owned', 'attached'))",
+      );
+    }
     this.selectSession = this.database.prepare<[string], SessionRow>(
       "SELECT * FROM chat_sessions WHERE chat_id = ?",
     );
+    this.selectSessionByThread = this.database.prepare<[string], SessionRow>(
+      "SELECT * FROM chat_sessions WHERE thread_id = ? LIMIT 1",
+    );
     this.upsertSession = this.database.prepare(`
       INSERT INTO chat_sessions (
-        chat_id, thread_id, cwd, status, active_turn_id, created_at, updated_at
+        chat_id, thread_id, cwd, binding_mode, status, active_turn_id, created_at, updated_at
       ) VALUES (
-        @chatId, @threadId, @cwd, @status, @activeTurnId, @createdAt, @updatedAt
+        @chatId, @threadId, @cwd, @bindingMode, @status, @activeTurnId, @createdAt, @updatedAt
       )
       ON CONFLICT(chat_id) DO UPDATE SET
         thread_id = excluded.thread_id,
         cwd = excluded.cwd,
+        binding_mode = excluded.binding_mode,
         status = excluded.status,
         active_turn_id = excluded.active_turn_id,
         created_at = excluded.created_at,
@@ -60,16 +74,12 @@ export class SqliteSessionStore implements SessionStore {
 
   async get(chatId: string): Promise<ChatSession | null> {
     const row = this.selectSession.get(chatId);
-    if (!row) return null;
-    return {
-      chatId: row.chat_id,
-      threadId: row.thread_id,
-      cwd: row.cwd,
-      status: row.status,
-      ...(row.active_turn_id ? { activeTurnId: row.active_turn_id } : {}),
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
+    return row ? fromRow(row) : null;
+  }
+
+  async getByThreadId(threadId: string): Promise<ChatSession | null> {
+    const row = this.selectSessionByThread.get(threadId);
+    return row ? fromRow(row) : null;
   }
 
   async set(session: ChatSession): Promise<void> {
@@ -77,6 +87,7 @@ export class SqliteSessionStore implements SessionStore {
       chatId: session.chatId,
       threadId: session.threadId,
       cwd: session.cwd,
+      bindingMode: session.bindingMode,
       status: session.status,
       activeTurnId: session.activeTurnId ?? null,
       createdAt: session.createdAt,
@@ -91,4 +102,17 @@ export class SqliteSessionStore implements SessionStore {
   close(): void {
     this.database.close();
   }
+}
+
+function fromRow(row: SessionRow): ChatSession {
+  return {
+    chatId: row.chat_id,
+    threadId: row.thread_id,
+    cwd: row.cwd,
+    bindingMode: row.binding_mode,
+    status: row.status,
+    ...(row.active_turn_id ? { activeTurnId: row.active_turn_id } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }

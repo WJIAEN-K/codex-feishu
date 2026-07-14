@@ -36,6 +36,8 @@ interface InboundMessage {
   chatId: string;
   messageId: string;
   text: string;
+  chatType: "p2p" | "group";
+  senderOpenId: string;
   resources: InboundResource[];
 }
 
@@ -106,8 +108,8 @@ export class CodexFeishuBridge {
     this.unsubscribeStderr = this.appServer.onStderr((line) => this.logger.debug(`Codex: ${line}`));
     this.feishu.setOnStatusChange((status) => this.logger.info(`Feishu status: ${status}`));
     this.feishu.setOnCardAction((action) => this.handleCardAction(action.requestId, action.action));
-    this.feishu.setOnMessage((chatId, messageId, text, _chatType, resources) => {
-      void this.receiveMessage({ chatId, messageId, text, resources }).catch((error: unknown) => {
+    this.feishu.setOnMessage((chatId, messageId, text, chatType, resources, senderOpenId) => {
+      void this.receiveMessage({ chatId, messageId, text, chatType, senderOpenId, resources }).catch((error: unknown) => {
         this.logger.error("Unable to handle Feishu message", error);
       });
     });
@@ -142,10 +144,26 @@ export class CodexFeishuBridge {
   private async receiveMessage(message: InboundMessage): Promise<void> {
     const text = message.text.trim();
     if (this.commands.isCommand(text)) {
-      const response = await this.commands.execute(message.chatId, text);
-      const session = await this.sessions.get(message.chatId);
-      if (session) this.mapper.registerThread(message.chatId, session.threadId);
-      await this.sendChunked(message.chatId, response, message.messageId);
+      const previous = await this.sessions.get(message.chatId);
+      try {
+        const response = await this.commands.execute({
+          chatId: message.chatId,
+          senderOpenId: message.senderOpenId,
+          chatType: message.chatType,
+        }, text);
+        const session = await this.sessions.get(message.chatId);
+        if (previous && previous.threadId !== session?.threadId) {
+          const runtime = this.runtimes.get(message.chatId);
+          if (!runtime || runtime.threadId !== previous.threadId) {
+            this.mapper.unregisterThread(previous.threadId);
+          }
+        }
+        if (session) this.mapper.registerThread(message.chatId, session.threadId);
+        await this.sendChunked(message.chatId, response, message.messageId);
+      } catch (error) {
+        const normalized = error instanceof Error ? error.message : String(error);
+        await this.sendChunked(message.chatId, `命令执行失败：${normalized}`, message.messageId);
+      }
       return;
     }
     if (!text && message.resources.length === 0) return;
@@ -440,6 +458,12 @@ export class CodexFeishuBridge {
       this.logger.warn("Unable to clear Feishu Typing reaction", reactionError);
     } finally {
       this.runtimes.delete(runtime.chatId);
+      try {
+        const current = await this.sessions.get(runtime.chatId);
+        if (current?.threadId !== runtime.threadId) this.mapper.unregisterThread(runtime.threadId);
+      } catch (sessionError) {
+        this.logger.warn("Unable to clean up completed thread mapping", sessionError);
+      }
       runtime.resolveDone();
     }
   }

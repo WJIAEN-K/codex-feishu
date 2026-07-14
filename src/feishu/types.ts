@@ -12,6 +12,7 @@ export type MessageHandler = (
   text: string,
   chatType: "p2p" | "group",
   resources: InboundResource[],
+  senderOpenId: string,
 ) => void;
 
 export interface FeishuCardAction {

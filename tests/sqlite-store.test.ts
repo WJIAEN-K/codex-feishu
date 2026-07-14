@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import Database from "better-sqlite3";
 
 import type { CodexAppServerClient } from "../src/app-server/client.js";
 import { SessionManager } from "../src/session/manager.js";
@@ -15,6 +16,30 @@ afterEach(async () => {
 });
 
 describe("SqliteSessionStore", () => {
+  it("migrates databases created before binding_mode was added", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-feishu-migration-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "sessions.sqlite");
+    const legacy = new Database(databasePath);
+    legacy.exec(`
+      CREATE TABLE chat_sessions (
+        chat_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        status TEXT NOT NULL,
+        active_turn_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      INSERT INTO chat_sessions VALUES ('chat-1', 'thread-1', '/workspace', 'idle', NULL, 100, 200);
+    `);
+    legacy.close();
+
+    const store = new SqliteSessionStore(databasePath);
+    await expect(store.get("chat-1")).resolves.toMatchObject({ bindingMode: "owned" });
+    store.close();
+  });
+
   it("persists all session fields across store instances", async () => {
     const directory = await mkdtemp(join(tmpdir(), "codex-feishu-store-"));
     temporaryDirectories.push(directory);
@@ -24,6 +49,7 @@ describe("SqliteSessionStore", () => {
       chatId: "chat-1",
       threadId: "thread-1",
       cwd: "/workspace",
+      bindingMode: "owned",
       status: "running",
       activeTurnId: "turn-1",
       createdAt: 100,
@@ -36,6 +62,7 @@ describe("SqliteSessionStore", () => {
       chatId: "chat-1",
       threadId: "thread-1",
       cwd: "/workspace",
+      bindingMode: "owned",
       status: "running",
       activeTurnId: "turn-1",
       createdAt: 100,
@@ -54,6 +81,7 @@ describe("SqliteSessionStore", () => {
       chatId: "chat-1",
       threadId: "thread-existing",
       cwd: "/workspace",
+      bindingMode: "owned",
       status: "running",
       activeTurnId: "turn-stale",
       createdAt: 100,

@@ -516,6 +516,7 @@ export class FeishuClient implements FeishuPort {
       text: string,
       chatType: "p2p" | "group",
       resources: InboundResource[],
+      senderOpenId: string,
     ) => void,
   ): void {
     this.onMessageCallback = cb;
@@ -551,6 +552,7 @@ export class FeishuClient implements FeishuPort {
       const chatId = msg.chat_id;
       const chatType = msg.chat_type;
       const messageId = msg.message_id;
+      const senderOpenId = sender.sender_id.open_id ?? "";
 
       // 解析消息内容和资源
       const { text, resources } = this.parseContentWithResources(msg.content, msg.message_type, msg.mentions);
@@ -562,7 +564,7 @@ export class FeishuClient implements FeishuPort {
         `text=${(text ?? "").substring(0, 50)}..., resources=${resources.length}`,
       );
 
-      this.onMessageCallback?.(chatId, messageId, text ?? "", chatType, resources);
+      this.onMessageCallback?.(chatId, messageId, text ?? "", chatType, resources, senderOpenId);
     } catch (err) {
       _warn("Error handling inbound message:", err);
     }

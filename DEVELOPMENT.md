@@ -22,7 +22,8 @@ FeishuClient ──► CodexFeishuBridge ──► SessionManager
 
 - `src/feishu/` 只负责飞书 WebSocket、REST、媒体、Reaction 和卡片。
 - `src/app-server/` 只负责 Codex 进程、JSON-RPC、协议调用和事件映射。
-- `src/session/` 负责 `chatId → threadId`、Turn 状态和 SQLite 持久化。
+- `src/session/` 负责 `chatId → threadId → cwd`、Turn 状态和 SQLite 持久化。
+- `src/workspace/` 负责项目注册、允许目录校验和管理员授权。
 - `src/commands/` 负责斜杠命令，不直接操作飞书 SDK。
 - `src/bridge/codex-feishu-bridge.ts` 是唯一业务编排层。
 
@@ -38,6 +39,8 @@ FeishuClient ──► CodexFeishuBridge ──► SessionManager
 6. 退出、超时或协议错误时拒绝相关 pending request。
 
 每个飞书聊天第一次使用时调用 `thread/start`；SQLite 中已有映射时调用 `thread/resume`。用户消息使用 `turn/start`，`/stop` 使用 `turn/interrupt`。
+
+`/project use` 使用所选工作目录创建新 Thread；仅管理员可通过 `/session list` 调用 `thread/list` 查询已有会话，或通过 `/session use` 在验证 Thread 工作目录后执行 `thread/read` 和 `thread/resume`。工作目录白名单使用规范化后的真实路径判断，防止 `..` 或符号链接越界。
 
 ## 事件与输出
 

@@ -9,6 +9,11 @@ export class MemorySessionStore implements SessionStore {
     return session ? { ...session } : null;
   }
 
+  async getByThreadId(threadId: string): Promise<ChatSession | null> {
+    const session = [...this.sessions.values()].find((candidate) => candidate.threadId === threadId);
+    return session ? { ...session } : null;
+  }
+
   async set(session: ChatSession): Promise<void> {
     this.sessions.set(session.chatId, { ...session });
   }

@@ -9,6 +9,8 @@ import { FeishuClient } from "./feishu/client.js";
 import { SessionManager } from "./session/manager.js";
 import { SqliteSessionStore } from "./session/sqlite-store.js";
 import { Logger } from "./utils/logger.js";
+import { WorkspaceRegistry } from "./workspace/registry.js";
+import { SqliteWorkspaceStore } from "./workspace/sqlite-store.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -26,12 +28,19 @@ async function main(): Promise<void> {
     requestTimeoutMs: config.codex.requestTimeoutMs,
   });
   const sessionStore = new SqliteSessionStore(config.sessionDatabasePath);
+  const workspaceStore = new SqliteWorkspaceStore(config.sessionDatabasePath);
+  const workspaces = new WorkspaceRegistry(workspaceStore, {
+    allowedRoots: config.codex.allowedRoots,
+    adminOpenIds: config.adminOpenIds,
+    defaultPath: config.codex.workingDirectory,
+  });
+  await workspaces.initialize();
   const sessions = new SessionManager(sessionStore, appServer, {
     cwd: config.codex.workingDirectory,
     model: config.codex.model,
     reasoningEffort: config.codex.reasoningEffort,
   });
-  const commands = new CommandRouter(sessions, appServer);
+  const commands = new CommandRouter(sessions, appServer, workspaces);
   const bridge = new CodexFeishuBridge(feishu, appServer, sessions, commands, logger);
 
   let stopping = false;
@@ -43,6 +52,7 @@ async function main(): Promise<void> {
       await bridge.stop();
     } finally {
       sessionStore.close();
+      workspaceStore.close();
     }
   };
   process.once("SIGINT", () => void shutdown());

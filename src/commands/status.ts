@@ -26,5 +26,6 @@ export async function statusCommand(
     `会话状态：${session ? sessionLabels[session.status] : "未创建"}`,
     `Thread ID：${session?.threadId ?? "-"}`,
     `工作目录：${session?.cwd ?? "-"}`,
+    `绑定方式：${session ? (session.bindingMode === "attached" ? "已有会话" : "飞书创建") : "-"}`,
   ].join("\n");
 }

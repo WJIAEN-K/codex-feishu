@@ -39,6 +39,15 @@ FEISHU_DOMAIN=feishu
 CODEX_WORKING_DIRECTORY=/absolute/path/to/project
 ```
 
+如需在飞书中配置和切换项目，设置允许访问的根目录和管理员：
+
+```bash
+CODEX_ALLOWED_ROOTS=/absolute/path/to/projects,/another/allowed/root
+FEISHU_ADMIN_OPEN_IDS=ou_xxxxxxxxx,ou_yyyyyyyyy
+```
+
+`CODEX_ALLOWED_ROOTS` 中只能使用绝对路径。飞书中注册的项目经过 `realpath` 校验，必须位于这些根目录内；只有 `FEISHU_ADMIN_OPEN_IDS` 中的用户可以添加或删除项目。未配置管理员时，项目列表只能读取和切换，不能从飞书修改。
+
 常用可选项：
 
 ```bash
@@ -72,7 +81,18 @@ npm start
 - `/new`：创建并切换到新的 Codex Thread。
 - `/stop`：通过 `turn/interrupt` 中断当前 Turn。
 - `/status`：查看 App Server、Session、Thread ID 和工作目录。
+- `/project list`：查看已注册项目。
+- `/project current`：查看当前项目和目录。
+- `/project use <别名>`：切换项目并创建新 Thread。
+- `/project add <别名> <绝对路径>`：注册项目，仅管理员可用。
+- `/project remove <别名>`：删除项目，仅管理员可用。
+- `/session list [项目别名]`：列出项目最近的 CLI、VS Code 和 App Server 会话，仅管理员可用。
+- `/session use <序号或Thread ID>`：绑定已有 Codex Thread，仅管理员可用。
+- `/session new [项目别名]`：在指定或当前项目创建新 Thread。
+- `/session current`：查看当前 Thread、目录和绑定方式。
 - `/help`：显示命令说明。
+
+切换项目会创建新的 Thread，避免把不同代码库的上下文混在一起。查看或绑定已有会话仅允许 `FEISHU_ADMIN_OPEN_IDS` 中的用户操作；绑定时还要求该 Thread 位于当前 App Server 可访问的本地 Codex 会话存储中，并且其工作目录位于 `CODEX_ALLOWED_ROOTS`。同一 Thread 同时只能绑定一个飞书聊天。
 
 ## 验证
 
@@ -104,6 +124,7 @@ VERIFY_TURN=1 npm run verify:app-server
 - Codex 以普通用户、`workspace-write` sandbox 和 `on-request` 审批策略运行。
 - App Server stdin/stdout 不暴露到网络，也不使用实验性 WebSocket 传输。
 - `.env`、SQLite 数据库和媒体临时文件不进入 Git。
+- 飞书项目目录受 `CODEX_ALLOWED_ROOTS` 白名单约束，项目增删受发送人 `open_id` 管理员列表控制。
 - 单个飞书入站媒体文件上限为 25 MiB，超限文件会立即删除。
 - 依赖通过 `npm audit` 审计；飞书 SDK 的易受攻击传递依赖被 overrides 固定到修复版本。
 

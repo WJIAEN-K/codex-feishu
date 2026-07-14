@@ -4,6 +4,9 @@ import type { CodexAppServerClient } from "../src/app-server/client.js";
 import { CommandRouter } from "../src/commands/index.js";
 import { SessionManager } from "../src/session/manager.js";
 import { MemorySessionStore } from "../src/session/memory-store.js";
+import type { WorkspaceRegistry } from "../src/workspace/registry.js";
+
+const context = { chatId: "chat-1", senderOpenId: "ou-test-user", chatType: "p2p" as const };
 
 function setup() {
   let thread = 0;
@@ -56,24 +59,40 @@ describe("SessionManager", () => {
 describe("CommandRouter", () => {
   it("implements /new, /stop, /status, and /help", async () => {
     const { manager } = setup();
-    const router = new CommandRouter(manager, { getStatus: () => "ready" });
+    const router = new CommandRouter(manager, { getStatus: () => "ready" }, {} as WorkspaceRegistry);
 
-    await expect(router.execute("chat-1", "/new")).resolves.toBe("已创建新的 Codex 会话。");
-    await expect(router.execute("chat-1", "/status")).resolves.toContain("Codex App Server：已连接");
-    await expect(router.execute("chat-1", "/stop")).resolves.toContain("当前没有");
-    await expect(router.execute("chat-1", "/help")).resolves.toContain("/status");
+    await expect(router.execute(context, "/new")).resolves.toBe("已创建新的 Codex 会话。");
+    await expect(router.execute(context, "/status")).resolves.toContain("Codex App Server：已连接");
+    await expect(router.execute(context, "/stop")).resolves.toContain("当前没有");
+    await expect(router.execute(context, "/help")).resolves.toContain("/status");
   });
 
   it("interrupts an active turn before /new replaces its thread", async () => {
     const { manager, request } = setup();
-    const router = new CommandRouter(manager, { getStatus: () => "ready" });
+    const router = new CommandRouter(manager, { getStatus: () => "ready" }, {} as WorkspaceRegistry);
     await manager.beginTurn("chat-1", [{ type: "text", text: "running" }]);
 
-    await expect(router.execute("chat-1", "/new")).resolves.toBe("已创建新的 Codex 会话。");
+    await expect(router.execute(context, "/new")).resolves.toBe("已创建新的 Codex 会话。");
     expect(request).toHaveBeenCalledWith("turn/interrupt", {
       threadId: "thread-1",
       turnId: "turn-1",
     });
     await expect(manager.get("chat-1")).resolves.toMatchObject({ threadId: "thread-2", status: "idle" });
+  });
+
+  it("keeps the current working directory when /new replaces a thread", async () => {
+    const { manager, request } = setup();
+    const router = new CommandRouter(manager, { getStatus: () => "ready" }, {} as WorkspaceRegistry);
+    await manager.create("chat-1", "/workspace/backend");
+
+    await router.execute(context, "/new");
+
+    expect(request).toHaveBeenLastCalledWith("thread/start", expect.objectContaining({
+      cwd: "/workspace/backend",
+    }));
+    await expect(manager.get("chat-1")).resolves.toMatchObject({
+      threadId: "thread-2",
+      cwd: "/workspace/backend",
+    });
   });
 });

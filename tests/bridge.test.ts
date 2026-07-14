@@ -13,6 +13,7 @@ import type {
 import { SessionManager } from "../src/session/manager.js";
 import { MemorySessionStore } from "../src/session/memory-store.js";
 import { Logger } from "../src/utils/logger.js";
+import type { WorkspaceRegistry } from "../src/workspace/registry.js";
 
 class FakeFeishu implements FeishuPort {
   handler?: MessageHandler;
@@ -55,8 +56,14 @@ class FakeFeishu implements FeishuPort {
   async stopTyping(chatId: string, success = true): Promise<void> {
     this.typingStops.push({ chatId, success });
   }
-  receive(chatId: string, messageId: string, text: string, resources: InboundResource[] = []): void {
-    this.handler?.(chatId, messageId, text, "p2p", resources);
+  receive(
+    chatId: string,
+    messageId: string,
+    text: string,
+    resources: InboundResource[] = [],
+    senderOpenId = "ou-test-user",
+  ): void {
+    this.handler?.(chatId, messageId, text, "p2p", resources, senderOpenId);
   }
   async click(requestId: string, action: "approve" | "reject"): Promise<void> {
     await this.cardActionHandler?.({ requestId, action });
@@ -140,7 +147,11 @@ async function setup() {
     appServer as unknown as Pick<CodexAppServerClient, "request">,
     { cwd: "/workspace" },
   );
-  const commands = new CommandRouter(sessions, appServer as unknown as CodexAppServerClient);
+  const commands = new CommandRouter(
+    sessions,
+    appServer as unknown as CodexAppServerClient,
+    {} as WorkspaceRegistry,
+  );
   const bridge = new CodexFeishuBridge(
     feishu,
     appServer as unknown as CodexAppServerClient,
@@ -295,6 +306,27 @@ describe("CodexFeishuBridge", () => {
     expect(feishu.messages[0]?.text).toBe("已创建新的 Codex 会话。");
     expect(feishu.messages[1]?.text).toContain("Codex App Server：已连接");
     expect(appServer.calls.some(({ method }) => method === "turn/start")).toBe(false);
+    await bridge.stop();
+  });
+
+  it("keeps the active thread mapped until an interrupted turn completes after /new", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+
+    feishu.receive("chat-1", "message-1", "长任务");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    feishu.receive("chat-1", "message-2", "/new");
+    await waitFor(() => feishu.messages.some(({ text }) => text === "已创建新的 Codex 会话。"));
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ threadId: "thread-2" });
+
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "cancelled" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    expect(feishu.typingStops).toEqual([{ chatId: "chat-1", success: false }]);
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ threadId: "thread-2", status: "idle" });
     await bridge.stop();
   });
 
