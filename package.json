@@ -1,55 +1,12 @@
 {
-  "name": "pi-feishu",
-  "version": "1.1.5",
-  "description": "Pi extension: remote control Pi via Feishu (飞书) Bot API — WebSocket chat bridge using official Lark SDK",
+  "name": "codex-feishu",
+  "version": "0.1.0",
+  "description": "Control Codex Agent through a Feishu or Lark bot using WebSocket long connections",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/surenkid/pi-feishu.git"
+    "url": "git+https://github.com/WJIAEN-K/codex-feishu.git"
   },
-  "homepage": "https://github.com/surenkid/pi-feishu",
-  "bugs": {
-    "url": "https://github.com/surenkid/pi-feishu/issues"
-  },
-  "keywords": [
-    "pi-package",
-    "pi",
-    "pi-extension",
-    "feishu",
-    "lark",
-    "bot-api",
-    "chat-bridge",
-    "websocket"
-  ],
-  "files": [
-    "src/index.ts",
-    "src/feishu-client.ts",
-    "src/types.ts"
-  ],
-  "pi": {
-    "extensions": [
-      "./src/index.ts"
-    ]
-  },
-  "scripts": {
-    "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck"
-  },
-  "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.64.0"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
-  },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    }
-  },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.2",
-    "typescript": "^5.5.0"
-  }
-}
+  "homepage": "https://github.com
