@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -55,6 +55,36 @@ describe("WorkspaceRegistry", () => {
     await expect(registry.add("outside", outside, "ou-admin")).rejects.toThrow("workspace.allowedRoots");
     await expect(registry.add("project", outside, "ou-user")).rejects.toThrow("管理员");
     await expect(registry.remove("default", "ou-admin")).rejects.toThrow("不能删除");
+  });
+
+  it("rejects stored paths and symlinks that escape the allowlist", async () => {
+    const { root, outside } = await fixture();
+    const escapedLink = join(root, "escaped-link");
+    await symlink(outside, escapedLink, "dir");
+    const store = new MemoryWorkspaceStore();
+    await store.set({
+      alias: "outside",
+      path: outside,
+      enabled: true,
+      createdBy: "config",
+      createdAt: 0,
+    });
+    await store.set({
+      alias: "escaped",
+      path: escapedLink,
+      enabled: true,
+      createdBy: "config",
+      createdAt: 0,
+    });
+    const registry = new WorkspaceRegistry(store, {
+      allowedRoots: [root],
+      adminOpenIds: [],
+      defaultPath: root,
+    });
+
+    await expect(registry.initialize()).rejects.toThrow("workspace.allowedRoots");
+    await expect(registry.get("outside")).rejects.toThrow("workspace.allowedRoots");
+    await expect(registry.get("escaped")).rejects.toThrow("workspace.allowedRoots");
   });
 
   it("persists project paths in the unified JSON configuration", async () => {

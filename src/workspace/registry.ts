@@ -1,7 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
-import { sep } from "node:path";
 
 import type { Workspace, WorkspaceStore } from "./store.js";
+import { isWorkspacePathAllowed, normalizeWorkspaceAlias } from "./validation.js";
 
 export interface WorkspaceRegistryOptions {
   allowedRoots: string[];
@@ -30,27 +30,28 @@ export class WorkspaceRegistry {
       createdBy: "system",
       createdAt: Date.now(),
     });
+    await this.list();
   }
 
-  list(): Promise<Workspace[]> {
-    return this.store.list();
+  async list(): Promise<Workspace[]> {
+    return Promise.all((await this.store.list()).map((workspace) => this.validateWorkspace(workspace)));
   }
 
   async findByPath(path: string): Promise<Workspace | null> {
     const canonicalPath = await this.validatePath(path);
-    return (await this.store.list()).find((workspace) => workspace.path === canonicalPath) ?? null;
+    return (await this.list()).find((workspace) => workspace.path === canonicalPath) ?? null;
   }
 
   async get(alias: string): Promise<Workspace> {
-    const normalized = normalizeAlias(alias);
+    const normalized = normalizeWorkspaceAlias(alias);
     const workspace = await this.store.get(normalized);
     if (!workspace?.enabled) throw new Error(`未知项目：${alias}`);
-    return workspace;
+    return this.validateWorkspace(workspace);
   }
 
   async add(alias: string, path: string, senderOpenId: string): Promise<Workspace> {
     this.requireAdmin(senderOpenId);
-    const normalized = normalizeAlias(alias);
+    const normalized = normalizeWorkspaceAlias(alias);
     if (normalized === "default") throw new Error("default 是保留项目名称");
     const canonicalPath = await this.validatePath(path);
     const workspace: Workspace = {
@@ -66,7 +67,7 @@ export class WorkspaceRegistry {
 
   async remove(alias: string, senderOpenId: string): Promise<void> {
     this.requireAdmin(senderOpenId);
-    const normalized = normalizeAlias(alias);
+    const normalized = normalizeWorkspaceAlias(alias);
     if (normalized === "default") throw new Error("不能删除 default 项目");
     if (!await this.store.get(normalized)) throw new Error(`未知项目：${alias}`);
     await this.store.delete(normalized);
@@ -75,7 +76,7 @@ export class WorkspaceRegistry {
   async validatePath(path: string): Promise<string> {
     const canonicalPath = await canonicalDirectory(path);
     if (this.allowedRoots.length === 0) throw new Error("工作区白名单尚未初始化");
-    if (!this.allowedRoots.some((root) => isInside(canonicalPath, root))) {
+    if (!isWorkspacePathAllowed(canonicalPath, this.allowedRoots)) {
       throw new Error("项目目录不在 workspace.allowedRoots 允许范围内");
     }
     return canonicalPath;
@@ -88,6 +89,10 @@ export class WorkspaceRegistry {
   private requireAdmin(senderOpenId: string): void {
     if (!this.isAdmin(senderOpenId)) throw new Error("只有配置的飞书管理员可以修改项目列表");
   }
+
+  private async validateWorkspace(workspace: Workspace): Promise<Workspace> {
+    return { ...workspace, path: await this.validatePath(workspace.path) };
+  }
 }
 
 async function canonicalDirectory(path: string): Promise<string> {
@@ -95,22 +100,4 @@ async function canonicalDirectory(path: string): Promise<string> {
   const metadata = await stat(canonicalPath);
   if (!metadata.isDirectory()) throw new Error(`不是目录：${path}`);
   return canonicalPath;
-}
-
-function normalizeAlias(alias: string): string {
-  const normalized = alias.trim().toLocaleLowerCase("en-US");
-  if (!/^[\p{L}\p{N}][\p{L}\p{N}._-]{0,31}$/u.test(normalized)) {
-    throw new Error("项目别名必须为 1～32 个字母、数字、点、下划线或连字符");
-  }
-  return normalized;
-}
-
-function isInside(path: string, root: string): boolean {
-  const normalizedPath = platformPath(path);
-  const normalizedRoot = platformPath(root);
-  return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}${sep}`);
-}
-
-function platformPath(path: string): string {
-  return process.platform === "win32" ? path.toLocaleLowerCase("en-US") : path;
 }

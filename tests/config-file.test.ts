@@ -40,6 +40,33 @@ describe("ConfigFile", () => {
     await expect(file.load()).rejects.toThrow("只支持 1");
   });
 
+  it("normalizes project aliases and rejects normalized duplicates or reserved aliases", async () => {
+    const { file, json, project } = await fixture();
+    json.workspace.projects = { " Backend ": { path: project } };
+    await file.save(json);
+    await expect(file.load()).resolves.toMatchObject({
+      json: { workspace: { projects: { backend: { path: project } } } },
+    });
+
+    json.workspace.projects = {
+      Backend: { path: project },
+      backend: { path: project },
+    };
+    await expect(file.save(json)).rejects.toThrow("规范化后重复");
+
+    json.workspace.projects = { default: { path: project } };
+    await expect(file.save(json)).rejects.toThrow("保留项目名称");
+  });
+
+  it("rejects configured project paths outside workspace.allowedRoots", async () => {
+    const { directory, file, json } = await fixture();
+    const outside = join(directory, "outside");
+    await mkdir(outside);
+    json.workspace.projects = { outside: { path: outside } };
+
+    await expect(file.save(json)).rejects.toThrow("workspace.allowedRoots");
+  });
+
   it("hot-watches valid updates and reports invalid JSON without replacing the last runtime", async () => {
     const { file, json } = await fixture();
     let resolveReload: ((level: string) => void) | undefined;

@@ -1,9 +1,13 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import type { FeishuConfig } from "../types.js";
 import type { LogLevel } from "../utils/logger.js";
+import {
+  isWorkspacePathAllowed,
+  normalizeWorkspaceAlias,
+} from "../workspace/validation.js";
 
 export interface JsonProjectConfig {
   path: string;
@@ -237,12 +241,23 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
     throw new Error("workspace.allowedRoots 至少需要一个路径");
   }
   const allowedRoots = draft.workspace.allowedRoots.map((path) => absolutePath(path, "workspace.allowedRoots"));
+  const canonicalAllowedRoots = allowedRoots.map((path) => canonicalDirectoryPath(path, "workspace.allowedRoots"));
   if (!isRecord(draft.workspace.projects)) throw new Error("workspace.projects 必须是 JSON 对象");
   const projects: Record<string, JsonProjectConfig> = {};
   for (const [alias, project] of Object.entries(draft.workspace.projects)) {
     if (!isRecord(project) || !nonEmpty(project.path)) throw new Error(`项目 ${alias} 缺少 path`);
-    projects[alias] = {
-      path: absolutePath(project.path, `workspace.projects.${alias}.path`),
+    const normalizedAlias = normalizeWorkspaceAlias(alias);
+    if (normalizedAlias === "default") throw new Error("default 是保留项目名称");
+    if (projects[normalizedAlias]) {
+      throw new Error(`项目别名规范化后重复：${alias} -> ${normalizedAlias}`);
+    }
+    const projectPath = absolutePath(project.path, `workspace.projects.${alias}.path`);
+    const canonicalProjectPath = canonicalDirectoryPath(projectPath, `workspace.projects.${alias}.path`);
+    if (!isWorkspacePathAllowed(canonicalProjectPath, canonicalAllowedRoots)) {
+      throw new Error(`项目 ${alias} 的目录不在 workspace.allowedRoots 允许范围内`);
+    }
+    projects[normalizedAlias] = {
+      path: projectPath,
       enabled: project.enabled !== false,
       createdBy: typeof project.createdBy === "string" ? project.createdBy : "config",
       createdAt: typeof project.createdAt === "number" ? project.createdAt : 0,
@@ -319,6 +334,16 @@ async function writeJsonAtomic(path: string, json: JsonAppConfig): Promise<void>
 function absolutePath(value: unknown, label: string): string {
   if (typeof value !== "string" || !isAbsolute(value)) throw new Error(`${label} 必须是绝对路径`);
   return resolve(value);
+}
+
+function canonicalDirectoryPath(path: string, label: string): string {
+  try {
+    const canonicalPath = realpathSync(path);
+    if (!statSync(canonicalPath).isDirectory()) throw new Error("not a directory");
+    return canonicalPath;
+  } catch {
+    throw new Error(`${label} 必须是存在的目录`);
+  }
 }
 
 function nonEmpty(value: unknown): value is string {

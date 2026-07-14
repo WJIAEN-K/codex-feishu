@@ -72,7 +72,7 @@ npm install
 }
 ```
 
-完整模板见 [codex-feishu.config.example.json](codex-feishu.config.example.json)。所有路径必须是绝对路径。`workspace.projects` 保存飞书 `/project add/remove` 管理的项目别名和路径；`workspace.allowedRoots` 是项目目录安全白名单。
+完整模板见 [codex-feishu.config.example.json](codex-feishu.config.example.json)。所有路径必须是绝对路径，`workspace.allowedRoots` 和 `workspace.projects` 中的目录必须已存在。项目别名会去除首尾空格并转换为小写，规范化后不能重复，且不能使用保留名称 `default`。`workspace.projects` 保存飞书 `/project add/remove` 管理的项目别名和路径；`workspace.allowedRoots` 是项目目录安全白名单，项目真实路径（包括符号链接解析结果）必须位于其中。
 
 使用其他配置文件：
 
