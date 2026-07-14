@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { ConfigFile, createDefaultJsonConfig } from "../src/config/index.js";
+import { JsonWorkspaceStore } from "../src/workspace/json-store.js";
 import { MemoryWorkspaceStore } from "../src/workspace/memory-store.js";
 import { WorkspaceRegistry } from "../src/workspace/registry.js";
-import { SqliteWorkspaceStore } from "../src/workspace/sqlite-store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -51,18 +52,23 @@ describe("WorkspaceRegistry", () => {
   it("rejects non-admin mutations and paths outside the allowlist", async () => {
     const { outside, registry } = await fixture();
 
-    await expect(registry.add("outside", outside, "ou-admin")).rejects.toThrow("CODEX_ALLOWED_ROOTS");
+    await expect(registry.add("outside", outside, "ou-admin")).rejects.toThrow("workspace.allowedRoots");
     await expect(registry.add("project", outside, "ou-user")).rejects.toThrow("管理员");
     await expect(registry.remove("default", "ou-admin")).rejects.toThrow("不能删除");
   });
 
-  it("persists workspaces in SQLite", async () => {
+  it("persists project paths in the unified JSON configuration", async () => {
     const { directory, root, project } = await fixture();
-    const databasePath = join(directory, "sessions.sqlite");
+    const configFile = new ConfigFile(join(directory, "config.json"));
+    const json = createDefaultJsonConfig(project);
+    json.feishu.appId = "cli_test";
+    json.feishu.appSecret = "secret";
+    json.workspace.allowedRoots = [root];
+    await configFile.save(json);
     const extra = join(root, "extra");
     await mkdir(extra);
 
-    const firstStore = new SqliteWorkspaceStore(databasePath);
+    const firstStore = new JsonWorkspaceStore(configFile);
     const first = new WorkspaceRegistry(firstStore, {
       allowedRoots: [root],
       adminOpenIds: ["ou-admin"],
@@ -70,13 +76,14 @@ describe("WorkspaceRegistry", () => {
     });
     await first.initialize();
     await first.add("extra", extra, "ou-admin");
-    firstStore.close();
 
-    const secondStore = new SqliteWorkspaceStore(databasePath);
+    const secondStore = new JsonWorkspaceStore(configFile);
     await expect(secondStore.get("extra")).resolves.toMatchObject({
       path: await realpath(extra),
       createdBy: "ou-admin",
     });
-    secondStore.close();
+    await expect(configFile.load()).resolves.toMatchObject({
+      json: { workspace: { projects: { extra: { path: await realpath(extra) } } } },
+    });
   });
 });

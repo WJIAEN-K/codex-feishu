@@ -19,7 +19,9 @@ Codex 官方 App Server 的飞书/Lark 客户端。服务通过飞书 Bot WebSoc
 
 - Node.js 20 或更高版本
 - 已安装并登录的 Codex CLI
-- 已创建并启用机器人的飞书或 Lark 自建应用
+- 可创建自建应用的飞书或 Lark 账号；也可以使用已有机器人凭证
+
+支持 macOS、Linux 和 Windows。Windows 上建议使用 PowerShell，并确保 `codex --version` 可以正常运行；程序会自动解析 npm 安装产生的 `codex.cmd`，停止时会清理其完整子进程树。
 
 ## 安装与配置
 
@@ -27,41 +29,83 @@ Codex 官方 App Server 的飞书/Lark 客户端。服务通过飞书 Bot WebSoc
 git clone https://github.com/WJIAEN-K/codex-feishu.git
 cd codex-feishu
 npm install
-cp .env.example .env
 ```
 
-至少配置：
+项目只使用 JSON 配置，不读取 `.env` 或业务环境变量。默认配置文件为启动目录下的 `.codex-feishu/config.json`。第一次在交互式终端启动且文件不存在时，程序会生成默认配置并显示飞书配置链接和二维码；扫码后自动写入 App ID、App Secret 和扫码人的管理员 Open ID，然后继续启动。
+
+从旧版本升级时，如果 JSON 尚未包含凭证，程序会一次性读取原有 `.env` 文件以及 `FEISHU_*`、`CODEX_*`、`LOG_LEVEL` 进程环境变量并生成 JSON，同时从旧 Session SQLite 的 `workspaces` 表导入项目列表。进程环境变量优先于 `.env`。迁移不会修改或删除旧文件、环境变量和数据库；JSON 生成后以 JSON 为准。
+
+最小配置结构如下，首次扫码时会自动生成，不需要手工创建：
+
+```json
+{
+  "version": 1,
+  "feishu": {
+    "appId": "cli_xxxxxxxxx",
+    "appSecret": "xxxxxxxxx",
+    "domain": "feishu",
+    "adminOpenIds": ["ou_xxxxxxxxx"]
+  },
+  "codex": {
+    "command": "codex",
+    "args": ["app-server", "--stdio"],
+    "requestTimeoutMs": 120000
+  },
+  "workspace": {
+    "defaultPath": "/absolute/path/to/project",
+    "allowedRoots": ["/absolute/path/to/projects"],
+    "projects": {
+      "backend": {
+        "path": "/absolute/path/to/projects/backend",
+        "enabled": true,
+        "createdBy": "config",
+        "createdAt": 0
+      }
+    }
+  },
+  "storage": {
+    "sessionDatabasePath": "/absolute/path/to/project/.codex-feishu/sessions.sqlite"
+  },
+  "runtime": {
+    "logLevel": "info"
+  }
+}
+```
+
+完整模板见 [codex-feishu.config.example.json](codex-feishu.config.example.json)。所有路径必须是绝对路径。`workspace.projects` 保存飞书 `/project add/remove` 管理的项目别名和路径；`workspace.allowedRoots` 是项目目录安全白名单。
+
+使用其他配置文件：
 
 ```bash
-FEISHU_APP_ID=cli_xxxxxxxxx
-FEISHU_APP_SECRET=xxxxxxxxx
-FEISHU_DOMAIN=feishu
-CODEX_WORKING_DIRECTORY=/absolute/path/to/project
+codex-feishu --config /absolute/path/to/config.json
+# 或源码运行
+npm start -- --config /absolute/path/to/config.json
 ```
 
-如需在飞书中配置和切换项目，设置允许访问的根目录和管理员：
+配置文件使用原子写入并设置为 `0600`。运行期间每 500ms 检查内容变化：`workspace.projects` 变更会直接生效，其他有效配置变化会自动断开并重建 Feishu/Codex 内部服务，无需重启 Node 进程。无效 JSON 或不合法路径不会替换当前运行配置；新配置启动失败时自动恢复上一份有效 JSON 和运行实例。
 
-```bash
-CODEX_ALLOWED_ROOTS=/absolute/path/to/projects,/another/allowed/root
-FEISHU_ADMIN_OPEN_IDS=ou_xxxxxxxxx,ou_yyyyyyyyy
-```
-
-`CODEX_ALLOWED_ROOTS` 中只能使用绝对路径。飞书中注册的项目经过 `realpath` 校验，必须位于这些根目录内；只有 `FEISHU_ADMIN_OPEN_IDS` 中的用户可以添加或删除项目。未配置管理员时，项目列表只能读取和切换，不能从飞书修改。
-
-常用可选项：
-
-```bash
-CODEX_COMMAND=codex
-CODEX_MODEL=
-CODEX_REASONING_EFFORT=
-CODEX_REQUEST_TIMEOUT_MS=120000
-CODEX_SESSION_DB_PATH=/absolute/path/to/sessions.sqlite
-LOG_LEVEL=info
-```
-
-`CODEX_WORKING_DIRECTORY` 必须是绝对路径。默认 Session 数据库存放在当前目录的 `.codex-feishu/sessions.sqlite`，该目录已被 Git 忽略。
+Docker、systemd、CI 等非交互环境不会等待扫码，必须预先挂载包含飞书凭证的 JSON 配置文件。
 
 ## 启动
+
+从 npm 包一键启动：
+
+```bash
+cd /absolute/path/to/project
+npx --yes codex-feishu-app-server@latest
+```
+
+第一次运行会显示二维码，后续运行会复用本地凭证。
+
+Windows PowerShell：
+
+```powershell
+cd C:\absolute\path\to\project
+codex --version
+npx --yes codex-feishu-app-server@latest
+```
+
+这里启动的是与 ChatGPT 账号登录状态兼容的本机 Codex App Server，不会通过 UI 自动化接管 ChatGPT 桌面端。Windows 新版 ChatGPT 中的 Codex 与 CLI 可以使用同一账号和本机会话存储，但飞书端仍通过官方 `codex app-server --stdio` 协议通信。
 
 开发模式：
 
@@ -92,7 +136,7 @@ npm start
 - `/session current`：查看当前 Thread、目录和绑定方式。
 - `/help`：显示命令说明。
 
-切换项目会创建新的 Thread，避免把不同代码库的上下文混在一起。查看或绑定已有会话仅允许 `FEISHU_ADMIN_OPEN_IDS` 中的用户操作；绑定时还要求该 Thread 位于当前 App Server 可访问的本地 Codex 会话存储中，并且其工作目录位于 `CODEX_ALLOWED_ROOTS`。同一 Thread 同时只能绑定一个飞书聊天。
+切换项目会创建新的 Thread，避免把不同代码库的上下文混在一起。查看或绑定已有会话仅允许 `feishu.adminOpenIds` 中的用户操作；绑定时还要求该 Thread 位于当前 App Server 可访问的本地 Codex 会话存储中，并且其工作目录位于 `workspace.allowedRoots`。同一 Thread 同时只能绑定一个飞书聊天。
 
 ## 验证
 
@@ -112,7 +156,7 @@ npm run verify:app-server
 额外启动一个只回复 `PONG`、不调用工具的真实 Turn：
 
 ```bash
-VERIFY_TURN=1 npm run verify:app-server
+npm run verify:app-server -- --turn
 ```
 
 如果 Codex 不在 `PATH`，可以把可执行文件路径作为最后一个参数传入。
@@ -123,8 +167,9 @@ VERIFY_TURN=1 npm run verify:app-server
 
 - Codex 以普通用户、`workspace-write` sandbox 和 `on-request` 审批策略运行。
 - App Server stdin/stdout 不暴露到网络，也不使用实验性 WebSocket 传输。
-- `.env`、SQLite 数据库和媒体临时文件不进入 Git。
-- 飞书项目目录受 `CODEX_ALLOWED_ROOTS` 白名单约束，项目增删受发送人 `open_id` 管理员列表控制。
+- JSON 配置、SQLite 数据库和媒体临时文件不进入 Git。
+- 扫码取得的 App Secret 只写入权限为 `0600` 的 JSON 配置文件，不在终端输出。
+- 飞书项目目录受 `workspace.allowedRoots` 白名单约束，项目增删受 `feishu.adminOpenIds` 控制。
 - 单个飞书入站媒体文件上限为 25 MiB，超限文件会立即删除。
 - 依赖通过 `npm audit` 审计；飞书 SDK 的易受攻击传递依赖被 overrides 固定到修复版本。
 

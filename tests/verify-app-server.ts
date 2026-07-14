@@ -3,7 +3,9 @@ import { AppServerEventMapper } from "../src/app-server/events.js";
 import { startThread } from "../src/app-server/thread.js";
 import { interruptTurn, startTurn } from "../src/app-server/turn.js";
 
-const command = process.argv[2] ?? process.env.CODEX_COMMAND ?? "codex";
+const argumentsList = process.argv.slice(2);
+const verifyTurn = argumentsList.includes("--turn");
+const command = argumentsList.find((argument) => argument !== "--turn") ?? "codex";
 const client = new CodexAppServerClient({
   command,
   args: ["app-server", "--stdio"],
@@ -18,7 +20,7 @@ try {
   console.log(`Codex App Server handshake: ${client.getStatus()}`);
   const threadId = await startThread(client, { cwd: process.cwd() });
   console.log(`Codex App Server thread/start: ${threadId}`);
-  if (process.env.VERIFY_TURN === "1") {
+  if (verifyTurn) {
     const mapper = new AppServerEventMapper();
     mapper.registerThread("verification", threadId);
     let text = "";

@@ -13,6 +13,7 @@ import {
   parseJsonRpcLine,
 } from "./jsonrpc.js";
 import type { InitializeParams } from "./protocol.js";
+import { buildAppServerSpawnSpec, terminateAppServerProcess } from "./process.js";
 
 export type AppServerStatus = "stopped" | "starting" | "ready" | "error";
 
@@ -72,10 +73,15 @@ export class CodexAppServerClient {
     this.stopping = false;
 
     try {
-      const child = spawn(this.options.command, this.options.args, {
+      const spawnSpec = buildAppServerSpawnSpec(this.options.command, this.options.args, {
+        env: this.options.env,
+        cwd: this.options.cwd,
+      });
+      const child = spawn(spawnSpec.command, spawnSpec.args, {
         stdio: ["pipe", "pipe", "pipe"],
         env: this.options.env,
         cwd: this.options.cwd,
+        windowsHide: spawnSpec.windowsHide,
       });
       this.child = child;
       this.attachProcess(child);
@@ -97,7 +103,9 @@ export class CodexAppServerClient {
       const normalized = this.normalizeError(error);
       this.rejectPending(normalized);
       this.emitError(normalized);
-      if (this.child && !this.child.killed) this.child.kill();
+      if (this.child && !this.child.killed) {
+        await terminateAndWait(this.child, true, 2_000);
+      }
       throw normalized;
     }
   }
@@ -111,18 +119,8 @@ export class CodexAppServerClient {
     this.child = null;
 
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        child.kill("SIGKILL");
-        resolve();
-      }, 2_000);
-      timeout.unref();
-      child.once("exit", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-      child.kill("SIGTERM");
-    });
+    if (await terminateAndWait(child, false, 2_000)) return;
+    await terminateAndWait(child, true, 2_000);
   }
 
   request<T>(method: string, params?: unknown): Promise<T> {
@@ -296,4 +294,30 @@ export class CodexAppServerClient {
   private normalizeError(error: unknown): Error {
     return error instanceof Error ? error : new Error(String(error));
   }
+}
+
+async function terminateAndWait(
+  child: ChildProcessWithoutNullStreams,
+  force: boolean,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  let onExit: (() => void) | undefined;
+  const exited = new Promise<boolean>((resolve) => {
+    onExit = () => resolve(true);
+    child.once("exit", onExit);
+  });
+  await terminateAppServerProcess(child, force);
+  if (child.exitCode !== null || child.signalCode !== null) {
+    if (onExit) child.off("exit", onExit);
+    return true;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  const result = await Promise.race([exited, timedOut]);
+  if (timer) clearTimeout(timer);
+  if (onExit) child.off("exit", onExit);
+  return result;
 }

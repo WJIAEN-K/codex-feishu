@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "feishu": {
+    "appId": "",
+    "appSecret": "",
+    "domain": "feishu",
+    "adminOpenIds": []
+  },
+  "codex": {
+    "command": "codex",
+    "args": ["app-server", "--stdio"],
+    "requestTimeoutMs": 120000
+  },
+  "workspace": {
+    "defaultPath": "/absolute/path/to/project",
+    "allowedRoots": ["/absolute/path/to/projects"],
+    "projects": {
+      "backend": {
+        "path": "/absolute/path/to/projects/backend",
+        "enabled": true,
+        "createdBy": "config",
+        "createdAt": 0
+      }
+    }
+  },
+  "storage": {
+    "sessionDatabasePath": "/absolute/path/to/project/.codex-feishu/sessions.sqlite"
+  },
+  "runtime": {
+    "logLevel": "info"
+  }
+}

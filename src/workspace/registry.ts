@@ -76,7 +76,7 @@ export class WorkspaceRegistry {
     const canonicalPath = await canonicalDirectory(path);
     if (this.allowedRoots.length === 0) throw new Error("工作区白名单尚未初始化");
     if (!this.allowedRoots.some((root) => isInside(canonicalPath, root))) {
-      throw new Error("项目目录不在 CODEX_ALLOWED_ROOTS 允许范围内");
+      throw new Error("项目目录不在 workspace.allowedRoots 允许范围内");
     }
     return canonicalPath;
   }

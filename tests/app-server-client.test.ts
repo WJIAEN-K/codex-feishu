@@ -1,9 +1,14 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CodexAppServerClient } from "../src/app-server/client.js";
 import { JsonRpcError, JsonRpcTimeoutError } from "../src/app-server/jsonrpc.js";
 
 const clients: CodexAppServerClient[] = [];
+const temporaryDirectories: string[] = [];
 
 function fakeServer(handlerSource: string, timeoutMs = 250): CodexAppServerClient {
   const script = `
@@ -30,6 +35,7 @@ function fakeServer(handlerSource: string, timeoutMs = 250): CodexAppServerClien
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.stop()));
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
 describe("CodexAppServerClient", () => {
@@ -102,4 +108,41 @@ describe("CodexAppServerClient", () => {
     expect(errors.some((error) => error.message.includes("Unable to parse"))).toBe(true);
     expect(errors.some((error) => error.message.includes("duplicate response"))).toBe(true);
   });
+
+  it.runIf(process.platform === "win32")(
+    "starts and stops a real npm-style .cmd shim on Windows",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "codex feishu-cmd-"));
+      temporaryDirectories.push(directory);
+      const serverPath = join(directory, "fake-server.cjs");
+      const commandPath = join(directory, "fake-codex.cmd");
+      await writeFile(serverPath, `
+        const readline = require("node:readline");
+        const rl = readline.createInterface({ input: process.stdin });
+        const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+        rl.on("line", (line) => {
+          const message = JSON.parse(line);
+          if (message.method === "initialize") send({ id: message.id, result: {} });
+          if (message.method === "echo") send({ id: message.id, result: message.params });
+        });
+      `, "utf8");
+      await writeFile(
+        commandPath,
+        `@echo off\r\n"${process.execPath}" "%~dp0fake-server.cjs" %*\r\n`,
+        "utf8",
+      );
+      const client = new CodexAppServerClient({
+        command: commandPath,
+        args: ["app-server", "--stdio"],
+        requestTimeoutMs: 2_000,
+      });
+      clients.push(client);
+
+      await client.start();
+      await expect(client.request("echo", { platform: "windows" }))
+        .resolves.toEqual({ platform: "windows" });
+      await client.stop();
+      expect(client.getStatus()).toBe("stopped");
+    },
+  );
 });
