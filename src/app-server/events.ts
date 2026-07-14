@@ -37,6 +37,10 @@ export class AppServerEventMapper {
     this.threadToChat.delete(threadId);
   }
 
+  chatIdForThread(threadId: string): string | undefined {
+    return this.threadToChat.get(threadId);
+  }
+
   map(notification: JsonRpcNotification): AgentEvent[] {
     const params = isObject(notification.params) ? notification.params : {};
     const threadId = extractId(params, "threadId", "thread");

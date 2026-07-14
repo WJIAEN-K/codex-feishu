@@ -17,7 +17,7 @@ export async function startTurn(client: RpcClient, options: StartTurnOptions): P
     input: options.input,
     cwd: options.cwd,
     ...(options.model ? { model: options.model } : {}),
-    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    ...(options.reasoningEffort ? { effort: options.reasoningEffort } : {}),
   });
   return resultId(result, "turn");
 }

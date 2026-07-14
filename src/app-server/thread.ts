@@ -13,11 +13,24 @@ export async function startThread(client: RpcClient, options: StartThreadOptions
   const result = await client.request<ThreadResult>("thread/start", {
     cwd: options.cwd,
     ...(options.model ? { model: options.model } : {}),
-    ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandbox: "workspace-write",
   });
   return resultId(result, "thread");
 }
 
-export async function resumeThread(client: RpcClient, threadId: string): Promise<void> {
-  await client.request("thread/resume", { threadId });
+export async function resumeThread(
+  client: RpcClient,
+  threadId: string,
+  options?: StartThreadOptions,
+): Promise<void> {
+  await client.request("thread/resume", {
+    threadId,
+    ...(options?.cwd ? { cwd: options.cwd } : {}),
+    ...(options?.model ? { model: options.model } : {}),
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandbox: "workspace-write",
+  });
 }

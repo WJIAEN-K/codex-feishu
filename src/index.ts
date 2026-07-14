@@ -7,7 +7,7 @@ import { CommandRouter } from "./commands/index.js";
 import { loadConfig } from "./config/index.js";
 import { FeishuClient } from "./feishu/client.js";
 import { SessionManager } from "./session/manager.js";
-import { MemorySessionStore } from "./session/memory-store.js";
+import { SqliteSessionStore } from "./session/sqlite-store.js";
 import { Logger } from "./utils/logger.js";
 
 async function main(): Promise<void> {
@@ -25,7 +25,8 @@ async function main(): Promise<void> {
     cwd: config.codex.workingDirectory,
     requestTimeoutMs: config.codex.requestTimeoutMs,
   });
-  const sessions = new SessionManager(new MemorySessionStore(), appServer, {
+  const sessionStore = new SqliteSessionStore(config.sessionDatabasePath);
+  const sessions = new SessionManager(sessionStore, appServer, {
     cwd: config.codex.workingDirectory,
     model: config.codex.model,
     reasoningEffort: config.codex.reasoningEffort,
@@ -39,6 +40,7 @@ async function main(): Promise<void> {
     stopping = true;
     logger.info("Shutting down");
     await bridge.stop();
+    sessionStore.close();
   };
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());

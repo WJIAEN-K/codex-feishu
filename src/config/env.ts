@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type { FeishuConfig } from "../types.js";
 
@@ -12,6 +12,7 @@ export interface AppConfig {
     reasoningEffort?: string;
     requestTimeoutMs: number;
   };
+  sessionDatabasePath: string;
   logLevel: "debug" | "info" | "warn" | "error";
 }
 
@@ -63,6 +64,9 @@ export function loadConfig(): AppConfig {
       reasoningEffort: optional("CODEX_REASONING_EFFORT"),
       requestTimeoutMs: positiveInteger("CODEX_REQUEST_TIMEOUT_MS", 120_000),
     },
+    sessionDatabasePath: resolve(
+      optional("CODEX_SESSION_DB_PATH") ?? join(process.cwd(), ".codex-feishu", "sessions.sqlite"),
+    ),
     logLevel: logLevel as AppConfig["logLevel"],
   };
 }

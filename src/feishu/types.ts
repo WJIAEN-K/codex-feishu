@@ -14,12 +14,21 @@ export type MessageHandler = (
   resources: InboundResource[],
 ) => void;
 
+export interface FeishuCardAction {
+  action: "approve" | "reject";
+  requestId: string;
+  messageId?: string;
+}
+
+export type CardActionHandler = (action: FeishuCardAction) => Promise<void> | void;
+
 export interface FeishuPort {
   connect(): Promise<void>;
   disconnect(): void;
   getStatus(): BridgeStatus;
   setOnMessage(handler: MessageHandler): void;
   setOnStatusChange(handler: (status: BridgeStatus) => void): void;
+  setOnCardAction(handler: CardActionHandler): void;
   sendMessage(chatId: string, text: string, replyToMessageId?: string): Promise<void>;
   sendCard(chatId: string, card: Record<string, unknown>, replyToMessageId?: string): Promise<string | null>;
   updateCard(messageId: string, card: Record<string, unknown>): Promise<void>;

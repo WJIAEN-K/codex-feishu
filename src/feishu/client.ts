@@ -14,7 +14,12 @@ import { stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "../types.js";
-import type { FeishuPort, InboundResource, MessageHandler } from "./types.js";
+import type {
+  CardActionHandler,
+  FeishuPort,
+  InboundResource,
+  MessageHandler,
+} from "./types.js";
 
 // ─── 日志 ─────────────────────────────────────────────
 
@@ -98,6 +103,7 @@ export class FeishuClient implements FeishuPort {
   // 回调 — 扩展为包含资源列表
   private onMessageCallback: MessageHandler | null = null;
   private onStatusChangeCallback: ((status: BridgeStatus) => void) | null = null;
+  private onCardActionCallback: CardActionHandler | null = null;
 
   // Reaction 跟踪：chatId → { msgId, reactionId }
   private typingMessages: Map<string, { msgId: string; reactionId: string }> = new Map();
@@ -148,6 +154,23 @@ export class FeishuClient implements FeishuPort {
         "im.chat.member.bot.added_v1": async () => {},
         "im.chat.member.bot.deleted_v1": async () => {},
         "im.chat.access_event.bot_p2p_chat_entered_v1": async () => {},
+        "card.action.trigger": async (data: any) => {
+          const value = data?.action?.value;
+          const action = value?.action;
+          const requestId = value?.requestId;
+          if (
+            this.onCardActionCallback
+            && (action === "approve" || action === "reject")
+            && typeof requestId === "string"
+          ) {
+            await this.onCardActionCallback({
+              action,
+              requestId,
+              messageId: data?.context?.open_message_id ?? data?.open_message_id,
+            });
+          }
+          return {};
+        },
       });
 
       if (this.wsClient) {
@@ -492,6 +515,10 @@ export class FeishuClient implements FeishuPort {
 
   setOnStatusChange(cb: (status: BridgeStatus) => void): void {
     this.onStatusChangeCallback = cb;
+  }
+
+  setOnCardAction(cb: CardActionHandler): void {
+    this.onCardActionCallback = cb;
   }
 
   // ─── 内部方法 ───────────────────────────────────────

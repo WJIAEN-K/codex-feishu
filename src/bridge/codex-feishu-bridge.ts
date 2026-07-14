@@ -1,16 +1,36 @@
+import {
+  mapApprovalRequest,
+  type ApprovalDecision,
+  type ApprovalRequest,
+} from "../app-server/approvals.js";
 import type { CodexAppServerClient } from "../app-server/client.js";
 import { AppServerEventMapper, type AgentEvent } from "../app-server/events.js";
-import type { JsonRpcNotification } from "../app-server/jsonrpc.js";
+import type { JsonRpcId, JsonRpcNotification, JsonRpcRequest } from "../app-server/jsonrpc.js";
 import type { TurnInput } from "../app-server/protocol.js";
 import type { CommandRouter } from "../commands/index.js";
-import { finalCard, progressCard, streamingCard, type ToolProgressEntry } from "../feishu/cards.js";
+import {
+  approvalCard,
+  approvalResolvedCard,
+  finalCard,
+  progressCard,
+  streamingCard,
+  type ToolProgressEntry,
+} from "../feishu/cards.js";
 import { splitText } from "../feishu/messages.js";
 import type { FeishuPort, InboundResource } from "../feishu/types.js";
 import type { SessionManager } from "../session/manager.js";
 import type { Logger } from "../utils/logger.js";
 
 type AppServerPort = Pick<CodexAppServerClient,
-  "start" | "stop" | "getStatus" | "onNotification" | "onError" | "onStderr">;
+  | "start"
+  | "stop"
+  | "getStatus"
+  | "onNotification"
+  | "onRequest"
+  | "onError"
+  | "onStderr"
+  | "respond"
+  | "respondError">;
 
 interface InboundMessage {
   chatId: string;
@@ -36,6 +56,12 @@ interface TurnRuntime {
   resolveDone: () => void;
 }
 
+interface PendingApproval {
+  request: ApprovalRequest;
+  chatId: string;
+  messageId: string | null;
+}
+
 export interface CodexFeishuBridgeOptions {
   streamFlushMs?: number;
 }
@@ -46,10 +72,12 @@ export class CodexFeishuBridge {
   private readonly processingChats = new Set<string>();
   private readonly runtimes = new Map<string, TurnRuntime>();
   private readonly eventChains = new Map<string, Promise<void>>();
+  private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly streamFlushMs: number;
   private unsubscribeNotification?: () => void;
   private unsubscribeError?: () => void;
   private unsubscribeStderr?: () => void;
+  private unsubscribeRequest?: () => void;
 
   constructor(
     private readonly feishu: FeishuPort,
@@ -64,12 +92,20 @@ export class CodexFeishuBridge {
 
   async start(): Promise<void> {
     this.unsubscribeNotification = this.appServer.onNotification((message) => this.onNotification(message));
+    this.unsubscribeRequest = this.appServer.onRequest((request) => {
+      void this.handleServerRequest(request).catch((error: unknown) => {
+        const normalized = error instanceof Error ? error : new Error(String(error));
+        this.logger.error("Approval request handling failed", normalized);
+        this.appServer.respondError(request.id, -32603, normalized.message);
+      });
+    });
     this.unsubscribeError = this.appServer.onError((error) => {
       this.logger.error("Codex App Server error", error);
       void this.failAllActiveTurns(error.message);
     });
     this.unsubscribeStderr = this.appServer.onStderr((line) => this.logger.debug(`Codex: ${line}`));
     this.feishu.setOnStatusChange((status) => this.logger.info(`Feishu status: ${status}`));
+    this.feishu.setOnCardAction((action) => this.handleCardAction(action.requestId, action.action));
     this.feishu.setOnMessage((chatId, messageId, text, _chatType, resources) => {
       void this.receiveMessage({ chatId, messageId, text, resources }).catch((error: unknown) => {
         this.logger.error("Unable to handle Feishu message", error);
@@ -86,12 +122,17 @@ export class CodexFeishuBridge {
   }
 
   async stop(): Promise<void> {
+    for (const pending of this.pendingApprovals.values()) {
+      this.appServer.respond(pending.request.requestId, { decision: "decline" });
+    }
+    this.pendingApprovals.clear();
     await this.failAllActiveTurns("codex-feishu 服务正在停止");
     this.feishu.disconnect();
     await this.appServer.stop();
     this.unsubscribeNotification?.();
     this.unsubscribeError?.();
     this.unsubscribeStderr?.();
+    this.unsubscribeRequest?.();
   }
 
   private async receiveMessage(message: InboundMessage): Promise<void> {
@@ -215,6 +256,63 @@ export class CodexFeishuBridge {
         if (this.eventChains.get(event.chatId) === next) this.eventChains.delete(event.chatId);
       });
     }
+  }
+
+  private async handleServerRequest(request: JsonRpcRequest): Promise<void> {
+    const approval = mapApprovalRequest(request);
+    if (!approval) {
+      this.appServer.respondError(request.id, -32601, `Unsupported App Server request ${request.method}`);
+      return;
+    }
+    const chatId = approval.threadId ? this.mapper.chatIdForThread(approval.threadId) : undefined;
+    if (!chatId) {
+      this.appServer.respondError(request.id, -32001, "No Feishu chat mapped to approval thread");
+      return;
+    }
+
+    const key = approvalKey(request.id);
+    const runtime = this.runtimes.get(chatId);
+    await this.sessions.updateStatus(
+      chatId,
+      "waiting_approval",
+      approval.turnId ?? runtime?.turnId,
+      approval.threadId,
+    );
+    const pending: PendingApproval = { request: approval, chatId, messageId: null };
+    this.pendingApprovals.set(key, pending);
+    const messageId = await this.feishu.sendCard(chatId, approvalCard(approval));
+    pending.messageId = messageId;
+    if (!messageId) {
+      this.pendingApprovals.delete(key);
+      this.appServer.respond(request.id, { decision: "decline" });
+      await this.sessions.updateStatus(
+        chatId,
+        "running",
+        approval.turnId ?? runtime?.turnId,
+        approval.threadId,
+      );
+    }
+  }
+
+  private async handleCardAction(requestId: string, action: "approve" | "reject"): Promise<void> {
+    const pending = this.pendingApprovals.get(requestId);
+    if (!pending) return;
+    this.pendingApprovals.delete(requestId);
+    const decision: ApprovalDecision = action === "approve" ? "accept" : "decline";
+    this.appServer.respond(pending.request.requestId, { decision });
+    if (pending.messageId) {
+      await this.feishu.updateCard(
+        pending.messageId,
+        approvalResolvedCard(pending.request, decision),
+      );
+    }
+    const runtime = this.runtimes.get(pending.chatId);
+    await this.sessions.updateStatus(
+      pending.chatId,
+      "running",
+      pending.request.turnId ?? runtime?.turnId,
+      pending.request.threadId,
+    );
   }
 
   private async handleAgentEvent(event: AgentEvent): Promise<void> {
@@ -346,4 +444,8 @@ function resourceLabel(type: InboundResource["type"]): string {
     case "video": return "视频";
     case "file": return "文件";
   }
+}
+
+function approvalKey(id: JsonRpcId): string {
+  return String(id);
 }

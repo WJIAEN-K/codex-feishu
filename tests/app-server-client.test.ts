@@ -66,7 +66,7 @@ describe("CodexAppServerClient", () => {
   });
 
   it("times out unanswered requests", async () => {
-    const client = fakeServer("", 30);
+    const client = fakeServer("", 100);
     await client.start();
     await expect(client.request("ignored")).rejects.toBeInstanceOf(JsonRpcTimeoutError);
   });

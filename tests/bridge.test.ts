@@ -1,16 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { CodexAppServerClient } from "../src/app-server/client.js";
-import type { JsonRpcNotification } from "../src/app-server/jsonrpc.js";
+import type { JsonRpcId, JsonRpcNotification, JsonRpcRequest } from "../src/app-server/jsonrpc.js";
 import { CodexFeishuBridge } from "../src/bridge/codex-feishu-bridge.js";
 import { CommandRouter } from "../src/commands/index.js";
-import type { FeishuPort, InboundResource, MessageHandler } from "../src/feishu/types.js";
+import type {
+  CardActionHandler,
+  FeishuPort,
+  InboundResource,
+  MessageHandler,
+} from "../src/feishu/types.js";
 import { SessionManager } from "../src/session/manager.js";
 import { MemorySessionStore } from "../src/session/memory-store.js";
 import { Logger } from "../src/utils/logger.js";
 
 class FakeFeishu implements FeishuPort {
   handler?: MessageHandler;
+  cardActionHandler?: CardActionHandler;
   messages: Array<{ chatId: string; text: string; replyTo?: string }> = [];
   cards: Array<{ id: string; card: Record<string, unknown>; replyTo?: string }> = [];
   updates: Array<{ id: string; card: Record<string, unknown> }> = [];
@@ -22,6 +28,7 @@ class FakeFeishu implements FeishuPort {
   getStatus() { return "connected" as const; }
   setOnMessage(handler: MessageHandler): void { this.handler = handler; }
   setOnStatusChange(): void {}
+  setOnCardAction(handler: CardActionHandler): void { this.cardActionHandler = handler; }
   async sendMessage(chatId: string, text: string, replyTo?: string): Promise<void> {
     this.messages.push({ chatId, text, replyTo });
   }
@@ -48,6 +55,9 @@ class FakeFeishu implements FeishuPort {
   receive(chatId: string, messageId: string, text: string, resources: InboundResource[] = []): void {
     this.handler?.(chatId, messageId, text, "p2p", resources);
   }
+  async click(requestId: string, action: "approve" | "reject"): Promise<void> {
+    await this.cardActionHandler?.({ requestId, action });
+  }
 }
 
 class FakeAppServer {
@@ -55,9 +65,11 @@ class FakeAppServer {
   threadCount = 0;
   turnCount = 0;
   calls: Array<{ method: string; params: unknown }> = [];
+  responses: Array<{ id: JsonRpcId; result?: unknown; error?: unknown }> = [];
   turnScenario: (threadId: string, turnId: string) => JsonRpcNotification[] = defaultScenario;
   private notifications = new Set<(message: JsonRpcNotification) => void>();
   private errors = new Set<(error: Error) => void>();
+  private requests = new Set<(request: JsonRpcRequest) => void>();
 
   async start(): Promise<void> { this.status = "ready"; }
   async stop(): Promise<void> { this.status = "stopped"; }
@@ -70,7 +82,15 @@ class FakeAppServer {
     this.errors.add(handler);
     return () => this.errors.delete(handler);
   }
+  onRequest(handler: (request: JsonRpcRequest) => void) {
+    this.requests.add(handler);
+    return () => this.requests.delete(handler);
+  }
   onStderr() { return () => {}; }
+  respond(id: JsonRpcId, result: unknown): void { this.responses.push({ id, result }); }
+  respondError(id: JsonRpcId, code: number, message: string): void {
+    this.responses.push({ id, error: { code, message } });
+  }
 
   async request<T>(method: string, params?: unknown): Promise<T> {
     this.calls.push({ method, params });
@@ -94,6 +114,10 @@ class FakeAppServer {
 
   fail(error: Error): void {
     for (const handler of this.errors) handler(error);
+  }
+
+  emitRequest(request: JsonRpcRequest): void {
+    for (const handler of this.requests) handler(request);
   }
 }
 
@@ -268,6 +292,38 @@ describe("CodexFeishuBridge", () => {
     expect(feishu.messages[0]?.text).toBe("已创建新的 Codex 会话。");
     expect(feishu.messages[1]?.text).toContain("Codex App Server：已连接");
     expect(appServer.calls.some(({ method }) => method === "turn/start")).toBe(false);
+    await bridge.stop();
+  });
+
+  it("sends approval cards and returns the user's decision to App Server", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "执行高风险操作");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 900,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        command: "docker compose down",
+        risk: "high",
+      },
+    });
+    await waitFor(() => allRenderedCardText(feishu).includes("docker compose down"));
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "waiting_approval" });
+
+    await feishu.click("900", "approve");
+    expect(appServer.responses).toContainEqual({ id: 900, result: { decision: "accept" } });
+    expect(allRenderedCardText(feishu)).toContain("已批准");
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "running" });
+
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
     await bridge.stop();
   });
 });

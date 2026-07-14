@@ -14,6 +14,8 @@ export interface SessionManagerOptions {
 type RpcClient = Pick<CodexAppServerClient, "request">;
 
 export class SessionManager {
+  private readonly attachedThreads = new Set<string>();
+
   constructor(
     private readonly store: SessionStore,
     private readonly client: RpcClient,
@@ -25,7 +27,19 @@ export class SessionManager {
   }
 
   async getOrCreate(chatId: string): Promise<ChatSession> {
-    return (await this.store.get(chatId)) ?? this.create(chatId);
+    const existing = await this.store.get(chatId);
+    if (!existing) return this.create(chatId);
+    if (!this.attachedThreads.has(existing.threadId)) {
+      await resumeThread(this.client, existing.threadId, this.options);
+      this.attachedThreads.add(existing.threadId);
+      if (existing.status === "running" || existing.status === "waiting_approval") {
+        existing.status = "idle";
+        delete existing.activeTurnId;
+        existing.updatedAt = Date.now();
+        await this.store.set(existing);
+      }
+    }
+    return existing;
   }
 
   async create(chatId: string): Promise<ChatSession> {
@@ -40,12 +54,14 @@ export class SessionManager {
       updatedAt: now,
     };
     await this.store.set(session);
+    this.attachedThreads.add(threadId);
     return session;
   }
 
   async resume(chatId: string): Promise<ChatSession> {
     const session = await this.requireSession(chatId);
-    await resumeThread(this.client, session.threadId);
+    await resumeThread(this.client, session.threadId, this.options);
+    this.attachedThreads.add(session.threadId);
     return session;
   }
 
