@@ -1,14 +1,15 @@
 {
   "name": "codex-feishu",
   "version": "0.1.0",
-  "description": "Control OpenAI Codex through a Feishu or Lark bot using WebSocket long connections",
+  "description": "Use OpenAI Codex App Server from Feishu or Lark",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
     "codex-feishu": "dist/index.js"
   },
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index
