@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 import "dotenv/config";
 
+import { CodexAppServerClient } from "./app-server/client.js";
+import { CodexFeishuBridge } from "./bridge/codex-feishu-bridge.js";
+import { CommandRouter } from "./commands/index.js";
 import { loadConfig } from "./config/index.js";
 import { FeishuClient } from "./feishu/client.js";
+import { SessionManager } from "./session/manager.js";
+import { MemorySessionStore } from "./session/memory-store.js";
 import { Logger } from "./utils/logger.js";
 
 async function main(): Promise<void> {
@@ -14,19 +19,31 @@ async function main(): Promise<void> {
   }
 
   const feishu = new FeishuClient(config.feishu);
-  feishu.setOnStatusChange((status) => logger.info(`Feishu status: ${status}`));
-  feishu.setOnMessage((chatId, messageId, text) => {
-    logger.info("Received Feishu message", { chatId, messageId, text });
+  const appServer = new CodexAppServerClient({
+    command: config.codex.command,
+    args: config.codex.args,
+    cwd: config.codex.workingDirectory,
+    requestTimeoutMs: config.codex.requestTimeoutMs,
   });
+  const sessions = new SessionManager(new MemorySessionStore(), appServer, {
+    cwd: config.codex.workingDirectory,
+    model: config.codex.model,
+    reasoningEffort: config.codex.reasoningEffort,
+  });
+  const commands = new CommandRouter(sessions, appServer);
+  const bridge = new CodexFeishuBridge(feishu, appServer, sessions, commands, logger);
 
-  const shutdown = (): void => {
+  let stopping = false;
+  const shutdown = async (): Promise<void> => {
+    if (stopping) return;
+    stopping = true;
     logger.info("Shutting down");
-    feishu.disconnect();
+    await bridge.stop();
   };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
 
-  await feishu.connect();
+  await bridge.start();
   logger.info("codex-feishu service started");
 }
 

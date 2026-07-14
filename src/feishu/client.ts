@@ -10,9 +10,11 @@
 
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "../types.js";
+import type { FeishuPort, InboundResource, MessageHandler } from "./types.js";
 
 // ─── 日志 ─────────────────────────────────────────────
 
@@ -36,6 +38,8 @@ const DEDUP_SWEEP_INTERVAL = 5 * 60 * 1000;
 const MESSAGE_EXPIRY_MS = 30 * 60 * 1000;
 /** 媒体文件临时目录 */
 const MEDIA_TEMP_DIR = join(tmpdir(), "feishu-media");
+/** 单个入站媒体文件最大 25 MiB，避免意外占满磁盘 */
+const MAX_MEDIA_FILE_BYTES = 25 * 1024 * 1024;
 /** 飞书 Reaction emoji 类型 */
 const REACTION_TYPING = "Typing";
 const REACTION_CROSS_MARK = "CrossMark";
@@ -76,16 +80,9 @@ interface FeishuMessageEvent {
 
 // ─── 导出类型 ──────────────────────────────────────────
 
-/** 入站消息中可能携带的资源描述 */
-export interface InboundResource {
-  type: "image" | "file" | "audio" | "video";
-  fileKey: string;
-  fileName?: string;
-}
-
 // ─── FeishuClient 类 ───────────────────────────────────
 
-export class FeishuClient {
+export class FeishuClient implements FeishuPort {
   private client: Lark.Client;
   private wsClient: Lark.WSClient | null = null;
   private abortController: AbortController | null = null;
@@ -99,15 +96,7 @@ export class FeishuClient {
   private botOpenId: string = "";
 
   // 回调 — 扩展为包含资源列表
-  private onMessageCallback:
-    | ((
-        chatId: string,
-        msgId: string,
-        text: string,
-        chatType: "p2p" | "group",
-        resources: InboundResource[],
-      ) => void)
-    | null = null;
+  private onMessageCallback: MessageHandler | null = null;
   private onStatusChangeCallback: ((status: BridgeStatus) => void) | null = null;
 
   // Reaction 跟踪：chatId → { msgId, reactionId }
@@ -342,6 +331,7 @@ export class FeishuClient {
       // 优先使用 writeFile()（SDK 原生写入磁盘）
       if (typeof resp.writeFile === "function") {
         await resp.writeFile(localPath);
+        if (!(await this.validateDownloadedFile(localPath))) return null;
         _log(`Resource downloaded via writeFile to ${localPath}`);
         return localPath;
       }
@@ -354,6 +344,10 @@ export class FeishuClient {
           chunks.push(Buffer.from(chunk));
         }
         const buffer = Buffer.concat(chunks);
+        if (buffer.length > MAX_MEDIA_FILE_BYTES) {
+          _warn(`Resource exceeds ${MAX_MEDIA_FILE_BYTES} bytes, discarded`);
+          return null;
+        }
         writeFileSync(localPath, buffer);
         _log(`Resource downloaded via stream to ${localPath} (${buffer.length} bytes)`);
         return localPath;
@@ -365,6 +359,14 @@ export class FeishuClient {
       _warn("Download resource failed:", err);
       return null;
     }
+  }
+
+  private async validateDownloadedFile(localPath: string): Promise<boolean> {
+    const info = await stat(localPath);
+    if (info.size <= MAX_MEDIA_FILE_BYTES) return true;
+    await unlink(localPath).catch(() => {});
+    _warn(`Resource exceeds ${MAX_MEDIA_FILE_BYTES} bytes, discarded: ${localPath}`);
+    return false;
   }
 
   /** 上传图片到飞书，返回 image_key */

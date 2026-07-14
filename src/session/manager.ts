@@ -66,10 +66,14 @@ export class SessionManager {
         model: this.options.model,
         reasoningEffort: this.options.reasoningEffort,
       });
-      session.activeTurnId = turnId;
-      session.updatedAt = Date.now();
-      await this.store.set(session);
-      return session;
+      const latest = await this.store.get(chatId);
+      if (!latest || latest.threadId !== session.threadId || latest.status !== "running") {
+        return latest ?? session;
+      }
+      latest.activeTurnId = turnId;
+      latest.updatedAt = Date.now();
+      await this.store.set(latest);
+      return latest;
     } catch (error) {
       session.status = "error";
       session.updatedAt = Date.now();
@@ -89,9 +93,11 @@ export class SessionManager {
     chatId: string,
     status: SessionStatus,
     activeTurnId?: string,
+    expectedThreadId?: string,
   ): Promise<ChatSession | null> {
     const session = await this.store.get(chatId);
     if (!session) return null;
+    if (expectedThreadId && session.threadId !== expectedThreadId) return session;
     session.status = status;
     if (activeTurnId === undefined) delete session.activeTurnId;
     else session.activeTurnId = activeTurnId;

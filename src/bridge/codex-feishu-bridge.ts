@@ -1,0 +1,349 @@
+import type { CodexAppServerClient } from "../app-server/client.js";
+import { AppServerEventMapper, type AgentEvent } from "../app-server/events.js";
+import type { JsonRpcNotification } from "../app-server/jsonrpc.js";
+import type { TurnInput } from "../app-server/protocol.js";
+import type { CommandRouter } from "../commands/index.js";
+import { finalCard, progressCard, streamingCard, type ToolProgressEntry } from "../feishu/cards.js";
+import { splitText } from "../feishu/messages.js";
+import type { FeishuPort, InboundResource } from "../feishu/types.js";
+import type { SessionManager } from "../session/manager.js";
+import type { Logger } from "../utils/logger.js";
+
+type AppServerPort = Pick<CodexAppServerClient,
+  "start" | "stop" | "getStatus" | "onNotification" | "onError" | "onStderr">;
+
+interface InboundMessage {
+  chatId: string;
+  messageId: string;
+  text: string;
+  resources: InboundResource[];
+}
+
+interface TurnRuntime {
+  chatId: string;
+  messageId: string;
+  threadId: string;
+  turnId?: string;
+  text: string;
+  streamMessageId: string | null;
+  progressMessageId: string | null;
+  tools: Map<string, ToolProgressEntry>;
+  flushTimer: ReturnType<typeof setTimeout> | null;
+  flushChain: Promise<void>;
+  progressChain: Promise<void>;
+  finishing: boolean;
+  done: Promise<void>;
+  resolveDone: () => void;
+}
+
+export interface CodexFeishuBridgeOptions {
+  streamFlushMs?: number;
+}
+
+export class CodexFeishuBridge {
+  private readonly mapper = new AppServerEventMapper();
+  private readonly queues = new Map<string, InboundMessage[]>();
+  private readonly processingChats = new Set<string>();
+  private readonly runtimes = new Map<string, TurnRuntime>();
+  private readonly eventChains = new Map<string, Promise<void>>();
+  private readonly streamFlushMs: number;
+  private unsubscribeNotification?: () => void;
+  private unsubscribeError?: () => void;
+  private unsubscribeStderr?: () => void;
+
+  constructor(
+    private readonly feishu: FeishuPort,
+    private readonly appServer: AppServerPort,
+    private readonly sessions: SessionManager,
+    private readonly commands: CommandRouter,
+    private readonly logger: Logger,
+    options: CodexFeishuBridgeOptions = {},
+  ) {
+    this.streamFlushMs = options.streamFlushMs ?? 750;
+  }
+
+  async start(): Promise<void> {
+    this.unsubscribeNotification = this.appServer.onNotification((message) => this.onNotification(message));
+    this.unsubscribeError = this.appServer.onError((error) => {
+      this.logger.error("Codex App Server error", error);
+      void this.failAllActiveTurns(error.message);
+    });
+    this.unsubscribeStderr = this.appServer.onStderr((line) => this.logger.debug(`Codex: ${line}`));
+    this.feishu.setOnStatusChange((status) => this.logger.info(`Feishu status: ${status}`));
+    this.feishu.setOnMessage((chatId, messageId, text, _chatType, resources) => {
+      void this.receiveMessage({ chatId, messageId, text, resources }).catch((error: unknown) => {
+        this.logger.error("Unable to handle Feishu message", error);
+      });
+    });
+
+    await this.appServer.start();
+    try {
+      await this.feishu.connect();
+    } catch (error) {
+      await this.appServer.stop();
+      throw error;
+    }
+  }
+
+  async stop(): Promise<void> {
+    await this.failAllActiveTurns("codex-feishu 服务正在停止");
+    this.feishu.disconnect();
+    await this.appServer.stop();
+    this.unsubscribeNotification?.();
+    this.unsubscribeError?.();
+    this.unsubscribeStderr?.();
+  }
+
+  private async receiveMessage(message: InboundMessage): Promise<void> {
+    const text = message.text.trim();
+    if (this.commands.isCommand(text)) {
+      const response = await this.commands.execute(message.chatId, text);
+      const session = await this.sessions.get(message.chatId);
+      if (session) this.mapper.registerThread(message.chatId, session.threadId);
+      await this.sendChunked(message.chatId, response, message.messageId);
+      return;
+    }
+    if (!text && message.resources.length === 0) return;
+
+    const queue = this.queues.get(message.chatId) ?? [];
+    queue.push({ ...message, text });
+    this.queues.set(message.chatId, queue);
+    if (this.processingChats.has(message.chatId)) {
+      await this.feishu.sendMessage(
+        message.chatId,
+        `已排队（前面还有 ${Math.max(1, queue.length - 1)} 条）`,
+        message.messageId,
+      );
+      return;
+    }
+    void this.processQueue(message.chatId);
+  }
+
+  private async processQueue(chatId: string): Promise<void> {
+    if (this.processingChats.has(chatId)) return;
+    this.processingChats.add(chatId);
+    try {
+      const queue = this.queues.get(chatId);
+      while (queue && queue.length > 0) {
+        const message = queue.shift();
+        if (!message) break;
+        await this.processTurn(message);
+      }
+    } finally {
+      this.processingChats.delete(chatId);
+      if (this.queues.get(chatId)?.length === 0) this.queues.delete(chatId);
+    }
+  }
+
+  private async processTurn(message: InboundMessage): Promise<void> {
+    await this.feishu.startTyping(message.chatId, message.messageId);
+    let runtime: TurnRuntime | undefined;
+    try {
+      const input = await this.buildInput(message);
+      if (input.length === 0) throw new Error("消息中没有可发送给 Codex 的内容");
+
+      const session = await this.sessions.getOrCreate(message.chatId);
+      this.mapper.registerThread(message.chatId, session.threadId);
+      runtime = this.createRuntime(message, session.threadId);
+      this.runtimes.set(message.chatId, runtime);
+
+      const updated = await this.sessions.beginTurn(message.chatId, input);
+      runtime.turnId = updated.activeTurnId;
+      await runtime.done;
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      if (runtime) await this.finishRuntime(runtime, false, normalized.message);
+      else {
+        await this.sessions.updateStatus(message.chatId, "error");
+        await this.sendChunked(message.chatId, `Codex 任务启动失败：${normalized.message}`, message.messageId);
+        await this.feishu.stopTyping(message.chatId, false);
+      }
+    }
+  }
+
+  private async buildInput(message: InboundMessage): Promise<TurnInput[]> {
+    const images: TurnInput[] = [];
+    const fileLines: string[] = [];
+    for (const resource of message.resources) {
+      const localPath = await this.feishu.downloadResource(
+        message.messageId,
+        resource.fileKey,
+        resource.type,
+        resource.fileName,
+      );
+      if (!localPath) {
+        fileLines.push(`无法下载用户上传的${resourceLabel(resource.type)}。`);
+      } else if (resource.type === "image") {
+        images.push({ type: "localImage", path: localPath });
+      } else {
+        fileLines.push(`用户上传${resourceLabel(resource.type)}：${localPath}`);
+      }
+    }
+
+    const text = [message.text, ...fileLines].filter(Boolean).join("\n");
+    return [...(text ? [{ type: "text" as const, text }] : []), ...images];
+  }
+
+  private createRuntime(message: InboundMessage, threadId: string): TurnRuntime {
+    let resolveDone = (): void => {};
+    const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+    return {
+      chatId: message.chatId,
+      messageId: message.messageId,
+      threadId,
+      text: "",
+      streamMessageId: null,
+      progressMessageId: null,
+      tools: new Map(),
+      flushTimer: null,
+      flushChain: Promise.resolve(),
+      progressChain: Promise.resolve(),
+      finishing: false,
+      done,
+      resolveDone,
+    };
+  }
+
+  private onNotification(notification: JsonRpcNotification): void {
+    for (const event of this.mapper.map(notification)) {
+      const previous = this.eventChains.get(event.chatId) ?? Promise.resolve();
+      const next = previous
+        .then(() => this.handleAgentEvent(event))
+        .catch((error: unknown) => this.logger.error("Agent event handling failed", error));
+      this.eventChains.set(event.chatId, next);
+      void next.finally(() => {
+        if (this.eventChains.get(event.chatId) === next) this.eventChains.delete(event.chatId);
+      });
+    }
+  }
+
+  private async handleAgentEvent(event: AgentEvent): Promise<void> {
+    const runtime = this.runtimes.get(event.chatId);
+    if (!runtime || (event.threadId && runtime.threadId !== event.threadId)) return;
+
+    switch (event.type) {
+      case "thread_started":
+        return;
+      case "turn_started":
+        runtime.turnId = event.turnId;
+        await this.sessions.updateStatus(event.chatId, "running", event.turnId, runtime.threadId);
+        return;
+      case "text_delta":
+        runtime.text += event.text;
+        this.scheduleStreamFlush(runtime);
+        return;
+      case "tool_started":
+        runtime.tools.set(event.itemId, {
+          itemId: event.itemId,
+          name: event.name,
+          detail: event.detail,
+          status: "running",
+        });
+        await this.syncProgress(runtime);
+        return;
+      case "tool_completed": {
+        const entry = runtime.tools.get(event.itemId);
+        if (entry) entry.status = event.success ? "done" : "error";
+        else runtime.tools.set(event.itemId, {
+          itemId: event.itemId,
+          name: "工具",
+          status: event.success ? "done" : "error",
+        });
+        await this.syncProgress(runtime);
+        return;
+      }
+      case "turn_completed":
+        await this.finishRuntime(runtime, event.success, event.error);
+        return;
+      case "error":
+        await this.finishRuntime(runtime, false, event.message);
+    }
+  }
+
+  private scheduleStreamFlush(runtime: TurnRuntime): void {
+    if (runtime.flushTimer || runtime.finishing) return;
+    runtime.flushTimer = setTimeout(() => {
+      runtime.flushTimer = null;
+      void this.flushStream(runtime, false);
+    }, this.streamFlushMs);
+    runtime.flushTimer.unref();
+  }
+
+  private flushStream(runtime: TurnRuntime, final: boolean): Promise<void> {
+    if (runtime.flushTimer) {
+      clearTimeout(runtime.flushTimer);
+      runtime.flushTimer = null;
+    }
+    runtime.flushChain = runtime.flushChain.then(async () => {
+      const text = splitText(runtime.text)[0] ?? "";
+      const card = final ? finalCard(text) : streamingCard(text);
+      if (runtime.streamMessageId) await this.feishu.updateCard(runtime.streamMessageId, card);
+      else runtime.streamMessageId = await this.feishu.sendCard(runtime.chatId, card, runtime.messageId);
+    });
+    return runtime.flushChain;
+  }
+
+  private syncProgress(runtime: TurnRuntime, finished = false): Promise<void> {
+    runtime.progressChain = runtime.progressChain.then(async () => {
+      const card = progressCard([...runtime.tools.values()], finished);
+      if (runtime.progressMessageId) await this.feishu.updateCard(runtime.progressMessageId, card);
+      else runtime.progressMessageId = await this.feishu.sendCard(runtime.chatId, card, runtime.messageId);
+    });
+    return runtime.progressChain;
+  }
+
+  private async finishRuntime(runtime: TurnRuntime, success: boolean, error?: string): Promise<void> {
+    if (runtime.finishing) return runtime.done;
+    runtime.finishing = true;
+    if (!success) {
+      const message = error ?? "Codex 任务执行失败";
+      runtime.text = runtime.text
+        ? `${runtime.text}\n\n---\nCodex 执行失败：${message}`
+        : `Codex 执行失败：${message}`;
+    } else if (!runtime.text) {
+      runtime.text = "Codex 任务已完成，但没有返回文本。";
+    }
+
+    try {
+      await this.flushStream(runtime, true);
+      const chunks = splitText(runtime.text);
+      for (const chunk of chunks.slice(1)) await this.feishu.sendMessage(runtime.chatId, chunk);
+      if (runtime.tools.size > 0) {
+        for (const entry of runtime.tools.values()) {
+          if (entry.status === "running") entry.status = success ? "done" : "error";
+        }
+        await this.syncProgress(runtime, true);
+      }
+      await this.sessions.updateStatus(
+        runtime.chatId,
+        success ? "idle" : "error",
+        undefined,
+        runtime.threadId,
+      );
+      await this.feishu.stopTyping(runtime.chatId, success);
+    } finally {
+      this.runtimes.delete(runtime.chatId);
+      runtime.resolveDone();
+    }
+  }
+
+  private async failAllActiveTurns(message: string): Promise<void> {
+    await Promise.all([...this.runtimes.values()].map((runtime) => this.finishRuntime(runtime, false, message)));
+  }
+
+  private async sendChunked(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
+    const chunks = splitText(text);
+    for (let index = 0; index < chunks.length; index += 1) {
+      await this.feishu.sendMessage(chatId, chunks[index] ?? "", index === 0 ? replyToMessageId : undefined);
+    }
+  }
+}
+
+function resourceLabel(type: InboundResource["type"]): string {
+  switch (type) {
+    case "image": return "图片";
+    case "audio": return "音频";
+    case "video": return "视频";
+    case "file": return "文件";
+  }
+}

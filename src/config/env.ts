@@ -37,10 +37,10 @@ export function loadConfig(): AppConfig {
   }
 
   const configuredCwd = optional("CODEX_WORKING_DIRECTORY") ?? process.cwd();
-  const workingDirectory = resolve(configuredCwd);
-  if (!isAbsolute(workingDirectory)) {
+  if (!isAbsolute(configuredCwd)) {
     throw new Error("CODEX_WORKING_DIRECTORY must be an absolute path");
   }
+  const workingDirectory = resolve(configuredCwd);
 
   const logLevel = optional("LOG_LEVEL") ?? "info";
   if (!(["debug", "info", "warn", "error"] as const).includes(logLevel as never)) {
