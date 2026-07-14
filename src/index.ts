@@ -39,8 +39,11 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     logger.info("Shutting down");
-    await bridge.stop();
-    sessionStore.close();
+    try {
+      await bridge.stop();
+    } finally {
+      sessionStore.close();
+    }
   };
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());

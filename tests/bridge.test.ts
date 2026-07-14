@@ -22,6 +22,8 @@ class FakeFeishu implements FeishuPort {
   updates: Array<{ id: string; card: Record<string, unknown> }> = [];
   typingStarts: string[] = [];
   typingStops: Array<{ chatId: string; success: boolean }> = [];
+  cardReturnsNull = false;
+  failCardUpdates = false;
 
   async connect(): Promise<void> {}
   disconnect(): void {}
@@ -32,12 +34,13 @@ class FakeFeishu implements FeishuPort {
   async sendMessage(chatId: string, text: string, replyTo?: string): Promise<void> {
     this.messages.push({ chatId, text, replyTo });
   }
-  async sendCard(_chatId: string, card: Record<string, unknown>, replyTo?: string): Promise<string> {
+  async sendCard(_chatId: string, card: Record<string, unknown>, replyTo?: string): Promise<string | null> {
     const id = `card-${this.cards.length + 1}`;
     this.cards.push({ id, card, replyTo });
-    return id;
+    return this.cardReturnsNull ? null : id;
   }
   async updateCard(id: string, card: Record<string, unknown>): Promise<void> {
+    if (this.failCardUpdates) throw new Error("card patch failed");
     this.updates.push({ id, card });
   }
   async downloadResource(
@@ -324,6 +327,38 @@ describe("CodexFeishuBridge", () => {
       threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
     } });
     await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
+
+  it("falls back to a text message when the final card cannot be created", async () => {
+    const { feishu, bridge } = await setup();
+    feishu.cardReturnsNull = true;
+    feishu.receive("chat-1", "message-1", "fallback");
+    await waitFor(() => feishu.typingStops.length === 1);
+    expect(feishu.messages.some(({ text }) => text === "完成")).toBe(true);
+    await bridge.stop();
+  });
+
+  it("cleans session and Typing even when final card update fails", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { feishu, appServer, sessions, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "delivery failure");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emit({ method: "item/agentMessage/delta", params: {
+      threadId: "thread-1", turnId: "turn-1", delta: "partial",
+    } });
+    await waitFor(() => feishu.cards.length === 1);
+    feishu.failCardUpdates = true;
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "idle" });
+    expect(feishu.typingStops).toEqual([{ chatId: "chat-1", success: true }]);
+    consoleError.mockRestore();
     await bridge.stop();
   });
 });

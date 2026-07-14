@@ -63,4 +63,17 @@ describe("CommandRouter", () => {
     await expect(router.execute("chat-1", "/stop")).resolves.toContain("当前没有");
     await expect(router.execute("chat-1", "/help")).resolves.toContain("/status");
   });
+
+  it("interrupts an active turn before /new replaces its thread", async () => {
+    const { manager, request } = setup();
+    const router = new CommandRouter(manager, { getStatus: () => "ready" });
+    await manager.beginTurn("chat-1", [{ type: "text", text: "running" }]);
+
+    await expect(router.execute("chat-1", "/new")).resolves.toBe("已创建新的 Codex 会话。");
+    expect(request).toHaveBeenCalledWith("turn/interrupt", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await expect(manager.get("chat-1")).resolves.toMatchObject({ threadId: "thread-2", status: "idle" });
+  });
 });

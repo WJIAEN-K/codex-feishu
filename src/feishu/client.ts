@@ -10,7 +10,7 @@
 
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { stat, unlink } from "node:fs/promises";
+import { readdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "../types.js";
@@ -45,6 +45,8 @@ const MESSAGE_EXPIRY_MS = 30 * 60 * 1000;
 const MEDIA_TEMP_DIR = join(tmpdir(), "feishu-media");
 /** 单个入站媒体文件最大 25 MiB，避免意外占满磁盘 */
 const MAX_MEDIA_FILE_BYTES = 25 * 1024 * 1024;
+const MEDIA_FILE_TTL_MS = 24 * 60 * 60 * 1000;
+const MEDIA_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 /** 飞书 Reaction emoji 类型 */
 const REACTION_TYPING = "Typing";
 const REACTION_CROSS_MARK = "CrossMark";
@@ -96,6 +98,7 @@ export class FeishuClient implements FeishuPort {
   // 消息去重
   private dedupMap: Map<string, number> = new Map();
   private dedupSweepTimer: ReturnType<typeof setInterval> | null = null;
+  private mediaSweepTimer: ReturnType<typeof setInterval> | null = null;
 
   // Bot 身份（连接后探测）
   private botOpenId: string = "";
@@ -209,6 +212,7 @@ export class FeishuClient implements FeishuPort {
 
       this.patchCardEvents();
       this.startDedupSweep();
+      this.startMediaSweep();
 
       await this.wsClient.start({ eventDispatcher: dispatcher });
 
@@ -240,6 +244,10 @@ export class FeishuClient implements FeishuPort {
     if (this.dedupSweepTimer) {
       clearInterval(this.dedupSweepTimer);
       this.dedupSweepTimer = null;
+    }
+    if (this.mediaSweepTimer) {
+      clearInterval(this.mediaSweepTimer);
+      this.mediaSweepTimer = null;
     }
 
     // 清除所有 typing reactions
@@ -812,6 +820,24 @@ export class FeishuClient implements FeishuPort {
       }
     }, DEDUP_SWEEP_INTERVAL);
     if (this.dedupSweepTimer.unref) this.dedupSweepTimer.unref();
+  }
+
+  private startMediaSweep(): void {
+    if (this.mediaSweepTimer) clearInterval(this.mediaSweepTimer);
+    const sweep = async (): Promise<void> => {
+      const now = Date.now();
+      const files = await readdir(MEDIA_TEMP_DIR).catch(() => []);
+      await Promise.all(files.map(async (fileName) => {
+        const path = join(MEDIA_TEMP_DIR, fileName);
+        const info = await stat(path).catch(() => null);
+        if (info?.isFile() && now - info.mtimeMs >= MEDIA_FILE_TTL_MS) {
+          await unlink(path).catch(() => {});
+        }
+      }));
+    };
+    void sweep();
+    this.mediaSweepTimer = setInterval(() => void sweep(), MEDIA_SWEEP_INTERVAL_MS);
+    this.mediaSweepTimer.unref();
   }
 
   private isMessageExpired(createTimeStr: string): boolean {

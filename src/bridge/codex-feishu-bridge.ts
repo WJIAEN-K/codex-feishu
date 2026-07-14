@@ -123,7 +123,11 @@ export class CodexFeishuBridge {
 
   async stop(): Promise<void> {
     for (const pending of this.pendingApprovals.values()) {
-      this.appServer.respond(pending.request.requestId, { decision: "decline" });
+      try {
+        this.appServer.respond(pending.request.requestId, { decision: "decline" });
+      } catch (error) {
+        this.logger.warn("Unable to decline pending approval during shutdown", error);
+      }
     }
     this.pendingApprovals.clear();
     await this.failAllActiveTurns("codex-feishu 服务正在停止");
@@ -376,7 +380,12 @@ export class CodexFeishuBridge {
       const text = splitText(runtime.text)[0] ?? "";
       const card = final ? finalCard(text) : streamingCard(text);
       if (runtime.streamMessageId) await this.feishu.updateCard(runtime.streamMessageId, card);
-      else runtime.streamMessageId = await this.feishu.sendCard(runtime.chatId, card, runtime.messageId);
+      else {
+        runtime.streamMessageId = await this.feishu.sendCard(runtime.chatId, card, runtime.messageId);
+        if (final && !runtime.streamMessageId) {
+          await this.feishu.sendMessage(runtime.chatId, text, runtime.messageId);
+        }
+      }
     });
     return runtime.flushChain;
   }
@@ -412,13 +421,23 @@ export class CodexFeishuBridge {
         }
         await this.syncProgress(runtime, true);
       }
+    } catch (deliveryError) {
+      this.logger.error("Unable to deliver final Feishu output", deliveryError);
+    }
+    try {
       await this.sessions.updateStatus(
         runtime.chatId,
         success ? "idle" : "error",
         undefined,
         runtime.threadId,
       );
+    } catch (sessionError) {
+      this.logger.error("Unable to update final session status", sessionError);
+    }
+    try {
       await this.feishu.stopTyping(runtime.chatId, success);
+    } catch (reactionError) {
+      this.logger.warn("Unable to clear Feishu Typing reaction", reactionError);
     } finally {
       this.runtimes.delete(runtime.chatId);
       runtime.resolveDone();
