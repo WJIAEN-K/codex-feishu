@@ -6,9 +6,6 @@ dist/
 .env.*
 !.env.example
 
-# Pi agent local state
-.pi/
-
 # Reference materials (not part of the package)
 reference/
 

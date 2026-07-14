@@ -1,5 +1,5 @@
 /**
- * feishu-client.ts — 飞书 WebSocket 客户端
+ * 飞书 WebSocket 客户端
  *
  * 基于 @larksuiteoapi/node-sdk 的 Client + WSClient + EventDispatcher 封装。
  * 负责：WebSocket 长连接管理、事件接收、消息发送、媒体收发、
@@ -12,7 +12,7 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { FeishuConfig, BridgeStatus } from "./types.js";
+import type { FeishuConfig, BridgeStatus } from "../types.js";
 
 // ─── 日志 ─────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ const DEDUP_MAX_ENTRIES = 5000;
 /** 去重定期清理间隔（5 分钟） */
 const DEDUP_SWEEP_INTERVAL = 5 * 60 * 1000;
 /** 消息过期判定（30 分钟） */
-const MESSAGE_EXPIRY_MS = 30 * 60 * 60 * 1000;
+const MESSAGE_EXPIRY_MS = 30 * 60 * 1000;
 /** 媒体文件临时目录 */
 const MEDIA_TEMP_DIR = join(tmpdir(), "feishu-media");
 /** 飞书 Reaction emoji 类型 */
