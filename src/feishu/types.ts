@@ -18,6 +18,7 @@ export type MessageHandler = (
 export interface FeishuCardAction {
   action: "approve" | "reject";
   requestId: string;
+  operatorOpenId: string;
   messageId?: string;
 }
 

@@ -17,7 +17,7 @@ import {
   type ToolProgressEntry,
 } from "../feishu/cards.js";
 import { splitText } from "../feishu/messages.js";
-import type { FeishuPort, InboundResource } from "../feishu/types.js";
+import type { FeishuCardAction, FeishuPort, InboundResource } from "../feishu/types.js";
 import type { SessionManager } from "../session/manager.js";
 import type { Logger } from "../utils/logger.js";
 
@@ -46,6 +46,7 @@ interface TurnRuntime {
   messageId: string;
   threadId: string;
   turnId?: string;
+  ownerOpenId: string;
   text: string;
   streamMessageId: string | null;
   progressMessageId: string | null;
@@ -62,10 +63,12 @@ interface PendingApproval {
   request: ApprovalRequest;
   chatId: string;
   messageId: string | null;
+  ownerOpenId: string;
 }
 
 export interface CodexFeishuBridgeOptions {
   streamFlushMs?: number;
+  maxQueuedPerChat?: number;
 }
 
 export class CodexFeishuBridge {
@@ -76,6 +79,7 @@ export class CodexFeishuBridge {
   private readonly eventChains = new Map<string, Promise<void>>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly streamFlushMs: number;
+  private readonly maxQueuedPerChat: number;
   private unsubscribeNotification?: () => void;
   private unsubscribeError?: () => void;
   private unsubscribeStderr?: () => void;
@@ -90,6 +94,7 @@ export class CodexFeishuBridge {
     options: CodexFeishuBridgeOptions = {},
   ) {
     this.streamFlushMs = options.streamFlushMs ?? 750;
+    this.maxQueuedPerChat = options.maxQueuedPerChat ?? 20;
   }
 
   async start(): Promise<void> {
@@ -103,11 +108,11 @@ export class CodexFeishuBridge {
     });
     this.unsubscribeError = this.appServer.onError((error) => {
       this.logger.error("Codex App Server error", error);
-      void this.failAllActiveTurns(error.message);
+      void this.handleAppServerFailure(error.message);
     });
     this.unsubscribeStderr = this.appServer.onStderr((line) => this.logger.debug(`Codex: ${line}`));
     this.feishu.setOnStatusChange((status) => this.logger.info(`Feishu status: ${status}`));
-    this.feishu.setOnCardAction((action) => this.handleCardAction(action.requestId, action.action));
+    this.feishu.setOnCardAction((action) => this.handleCardAction(action));
     this.feishu.setOnMessage((chatId, messageId, text, chatType, resources, senderOpenId) => {
       void this.receiveMessage({ chatId, messageId, text, chatType, senderOpenId, resources }).catch((error: unknown) => {
         this.logger.error("Unable to handle Feishu message", error);
@@ -169,6 +174,14 @@ export class CodexFeishuBridge {
     if (!text && message.resources.length === 0) return;
 
     const queue = this.queues.get(message.chatId) ?? [];
+    if (queue.length >= this.maxQueuedPerChat) {
+      await this.feishu.sendMessage(
+        message.chatId,
+        "当前任务排队数量达到限制。请等待完成或执行 /stop。",
+        message.messageId,
+      );
+      return;
+    }
     queue.push({ ...message, text });
     this.queues.set(message.chatId, queue);
     if (this.processingChats.has(message.chatId)) {
@@ -244,7 +257,7 @@ export class CodexFeishuBridge {
     }
 
     const text = [message.text, ...fileLines].filter(Boolean).join("\n");
-    return [...(text ? [{ type: "text" as const, text }] : []), ...images];
+    return [...(text ? [{ type: "text" as const, text, text_elements: [] }] : []), ...images];
   }
 
   private createRuntime(message: InboundMessage, threadId: string): TurnRuntime {
@@ -254,6 +267,7 @@ export class CodexFeishuBridge {
       chatId: message.chatId,
       messageId: message.messageId,
       threadId,
+      ownerOpenId: message.senderOpenId,
       text: "",
       streamMessageId: null,
       progressMessageId: null,
@@ -294,13 +308,22 @@ export class CodexFeishuBridge {
 
     const key = approvalKey(request.id);
     const runtime = this.runtimes.get(chatId);
+    if (!runtime) {
+      this.appServer.respondError(request.id, -32002, "No active Feishu task owner for approval");
+      return;
+    }
     await this.sessions.updateStatus(
       chatId,
       "waiting_approval",
       approval.turnId ?? runtime?.turnId,
       approval.threadId,
     );
-    const pending: PendingApproval = { request: approval, chatId, messageId: null };
+    const pending: PendingApproval = {
+      request: approval,
+      chatId,
+      messageId: null,
+      ownerOpenId: runtime.ownerOpenId,
+    };
     this.pendingApprovals.set(key, pending);
     const messageId = await this.feishu.sendCard(chatId, approvalCard(approval));
     pending.messageId = messageId;
@@ -316,11 +339,15 @@ export class CodexFeishuBridge {
     }
   }
 
-  private async handleCardAction(requestId: string, action: "approve" | "reject"): Promise<void> {
-    const pending = this.pendingApprovals.get(requestId);
+  private async handleCardAction(action: FeishuCardAction): Promise<void> {
+    const pending = this.pendingApprovals.get(action.requestId);
     if (!pending) return;
-    this.pendingApprovals.delete(requestId);
-    const decision: ApprovalDecision = action === "approve" ? "accept" : "decline";
+    if (action.operatorOpenId !== pending.ownerOpenId) {
+      await this.feishu.sendMessage(pending.chatId, "只有发起当前任务的用户可以处理该审批。");
+      return;
+    }
+    this.pendingApprovals.delete(action.requestId);
+    const decision: ApprovalDecision = action.action === "approve" ? "accept" : "decline";
     this.appServer.respond(pending.request.requestId, { decision });
     if (pending.messageId) {
       await this.feishu.updateCard(
@@ -350,6 +377,11 @@ export class CodexFeishuBridge {
         return;
       case "text_delta":
         runtime.text += event.text;
+        this.scheduleStreamFlush(runtime);
+        return;
+      case "text_completed":
+        if (!runtime.text) runtime.text = event.text;
+        else if (event.text.startsWith(runtime.text)) runtime.text += event.text.slice(runtime.text.length);
         this.scheduleStreamFlush(runtime);
         return;
       case "tool_started":
@@ -470,6 +502,11 @@ export class CodexFeishuBridge {
 
   private async failAllActiveTurns(message: string): Promise<void> {
     await Promise.all([...this.runtimes.values()].map((runtime) => this.finishRuntime(runtime, false, message)));
+  }
+
+  private async handleAppServerFailure(message: string): Promise<void> {
+    this.pendingApprovals.clear();
+    await this.failAllActiveTurns(message);
   }
 
   private async sendChunked(chatId: string, text: string, replyToMessageId?: string): Promise<void> {

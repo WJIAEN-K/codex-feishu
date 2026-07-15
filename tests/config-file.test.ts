@@ -31,7 +31,14 @@ describe("ConfigFile", () => {
     const config = await file.load();
     expect(config.codex.workingDirectory).toBe(project);
     expect(config.codex.allowedRoots).toEqual([project]);
+    expect(config.maxQueuedPerChat).toBe(20);
     expect(resolveConfigPath(["--config", "custom.json"], directory)).toBe(join(directory, "custom.json"));
+  });
+
+  it("validates the per-chat queue limit", async () => {
+    const { file, json } = await fixture();
+    json.queue.maxPerChat = 0;
+    await expect(file.save(json)).rejects.toThrow("queue.maxPerChat");
   });
 
   it("rejects unsupported configuration versions instead of coercing them", async () => {

@@ -12,6 +12,9 @@ Codex 官方 App Server 的飞书/Lark 客户端。服务通过飞书 Bot WebSoc
 - 高风险命令和文件修改可通过飞书审批卡片批准或拒绝。
 - Typing Reaction 在任务开始时添加，在完成或失败时可靠清理。
 - 同一聊天的消息顺序排队，不同聊天可并行执行。
+- App Server 异常退出后按 1s、2s、5s、10s、30s 指数退避自动重启，并恢复持久化 Thread。
+- JSON-RPC stdin 使用串行写入队列处理背压；单聊天等待队列默认最多 20 条。
+- 审批按钮仅允许当前任务发起人操作，群聊中的其他成员不能代为批准。
 
 唯一 Agent 接口是 `codex app-server --stdio`。项目不依赖 Pi Agent、不使用 `codex exec`，也不控制 Codex Desktop UI。
 
@@ -66,13 +69,16 @@ npm install
   "storage": {
     "sessionDatabasePath": "/absolute/path/to/project/.codex-feishu/sessions.sqlite"
   },
+  "queue": {
+    "maxPerChat": 20
+  },
   "runtime": {
     "logLevel": "info"
   }
 }
 ```
 
-完整模板见 [codex-feishu.config.example.json](codex-feishu.config.example.json)。所有路径必须是绝对路径，`workspace.allowedRoots` 和 `workspace.projects` 中的目录必须已存在。项目别名会去除首尾空格并转换为小写，规范化后不能重复，且不能使用保留名称 `default`。`workspace.projects` 保存飞书 `/project add/remove` 管理的项目别名和路径；`workspace.allowedRoots` 是项目目录安全白名单，项目真实路径（包括符号链接解析结果）必须位于其中。
+完整模板见 [codex-feishu.config.example.json](codex-feishu.config.example.json)。所有路径必须是绝对路径，`workspace.allowedRoots` 和 `workspace.projects` 中的目录必须已存在。项目别名会去除首尾空格并转换为小写，规范化后不能重复，且不能使用保留名称 `default`。`workspace.projects` 保存飞书 `/project add/remove` 管理的项目别名和路径；`workspace.allowedRoots` 是项目目录安全白名单，项目真实路径（包括符号链接解析结果）必须位于其中。`queue.maxPerChat` 控制单个聊天可等待的消息数，达到上限后新消息会被拒绝并提示等待或执行 `/stop`。
 
 使用其他配置文件：
 
@@ -151,6 +157,12 @@ npm audit
 
 ```bash
 npm run verify:app-server
+```
+
+Codex 升级后可按已安装版本重新生成官方 App Server TypeScript schema，用于协议差异核对：
+
+```bash
+npm run generate:app-server-types
 ```
 
 额外启动一个只回复 `PONG`、不调用工具的真实 Turn：

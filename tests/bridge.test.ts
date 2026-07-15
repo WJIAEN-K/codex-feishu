@@ -65,8 +65,12 @@ class FakeFeishu implements FeishuPort {
   ): void {
     this.handler?.(chatId, messageId, text, "p2p", resources, senderOpenId);
   }
-  async click(requestId: string, action: "approve" | "reject"): Promise<void> {
-    await this.cardActionHandler?.({ requestId, action });
+  async click(
+    requestId: string,
+    action: "approve" | "reject",
+    operatorOpenId = "ou-test-user",
+  ): Promise<void> {
+    await this.cardActionHandler?.({ requestId, action, operatorOpenId });
   }
 }
 
@@ -139,7 +143,7 @@ function defaultScenario(threadId: string, turnId: string): JsonRpcNotification[
   ];
 }
 
-async function setup() {
+async function setup(options: { maxQueuedPerChat?: number } = {}) {
   const feishu = new FakeFeishu();
   const appServer = new FakeAppServer();
   const sessions = new SessionManager(
@@ -158,7 +162,7 @@ async function setup() {
     sessions,
     commands,
     new Logger("error"),
-    { streamFlushMs: 1 },
+    { streamFlushMs: 1, maxQueuedPerChat: options.maxQueuedPerChat },
   );
   await bridge.start();
   return { feishu, appServer, sessions, bridge };
@@ -209,6 +213,26 @@ describe("CodexFeishuBridge", () => {
     await bridge.stop();
   });
 
+  it("delivers the completed agent message when the server emits no deltas", async () => {
+    const { feishu, appServer, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+      { method: "item/completed", params: {
+        threadId,
+        turnId,
+        item: { id: "message-1", type: "agentMessage", text: "仅最终消息" },
+      } },
+      { method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed" } } },
+    ];
+
+    feishu.receive("chat-1", "message-1", "只返回最终文本");
+    await waitFor(() => feishu.typingStops.length === 1);
+
+    expect(allRenderedCardText(feishu)).toContain("仅最终消息");
+    expect(allRenderedCardText(feishu)).not.toContain("没有返回文本");
+    await bridge.stop();
+  });
+
   it("queues messages and reuses the same thread for multiple turns", async () => {
     const { feishu, appServer, bridge } = await setup();
     feishu.receive("chat-1", "message-1", "第一条");
@@ -218,6 +242,29 @@ describe("CodexFeishuBridge", () => {
     expect(appServer.calls.filter(({ method }) => method === "thread/start")).toHaveLength(1);
     expect(appServer.calls.filter(({ method }) => method === "turn/start")).toHaveLength(2);
     expect(feishu.messages.some(({ text }) => text.includes("已排队"))).toBe(true);
+    await bridge.stop();
+  });
+
+  it("rejects messages beyond the per-chat queue limit", async () => {
+    const { feishu, appServer, bridge } = await setup({ maxQueuedPerChat: 1 });
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "执行中");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    feishu.receive("chat-1", "message-2", "进入队列");
+    feishu.receive("chat-1", "message-3", "超出限制");
+    await waitFor(() => feishu.messages.some(({ text }) => text.includes("达到限制")));
+
+    expect(feishu.messages.some(({ text }) => text.includes("达到限制"))).toBe(true);
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => appServer.calls.filter(({ method }) => method === "turn/start").length === 2);
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-2", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 2);
     await bridge.stop();
   });
 
@@ -236,6 +283,7 @@ describe("CodexFeishuBridge", () => {
     expect(input).toContainEqual({
       type: "text",
       text: "分析附件\n用户上传文件：/tmp/feishu-media/report.xlsx",
+      text_elements: [],
     });
     await bridge.stop();
   });
@@ -355,6 +403,33 @@ describe("CodexFeishuBridge", () => {
     expect(allRenderedCardText(feishu)).toContain("已批准");
     await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "running" });
 
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
+
+  it("only allows the task creator to resolve an approval", async () => {
+    const { feishu, appServer, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "需要审批", [], "ou-owner");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 901,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-1", command: "dangerous" },
+    });
+    await waitFor(() => feishu.cards.length === 1);
+
+    await feishu.click("901", "approve", "ou-other");
+    expect(appServer.responses).not.toContainEqual({ id: 901, result: { decision: "accept" } });
+    expect(feishu.messages.some(({ text }) => text.includes("只有发起当前任务"))).toBe(true);
+
+    await feishu.click("901", "approve", "ou-owner");
+    expect(appServer.responses).toContainEqual({ id: 901, result: { decision: "accept" } });
     appServer.emit({ method: "turn/completed", params: {
       threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
     } });

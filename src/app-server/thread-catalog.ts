@@ -1,4 +1,8 @@
 import type { CodexAppServerClient } from "./client.js";
+import type { ThreadListParams } from "./generated/v2/ThreadListParams.js";
+import type { ThreadListResponse } from "./generated/v2/ThreadListResponse.js";
+import type { ThreadReadParams } from "./generated/v2/ThreadReadParams.js";
+import type { ThreadReadResponse } from "./generated/v2/ThreadReadResponse.js";
 
 export interface ThreadSummary {
   id: string;
@@ -15,37 +19,31 @@ export type ThreadStatus =
   | { type: "systemError" }
   | { type: "active"; activeFlags?: unknown[] };
 
-interface ThreadListResult {
-  data?: unknown;
-}
-
-interface ThreadReadResult {
-  thread?: unknown;
-}
-
 type RpcClient = Pick<CodexAppServerClient, "request">;
 
 export class ThreadCatalog {
   constructor(private readonly client: RpcClient) {}
 
   async list(cwd?: string, limit = 20): Promise<ThreadSummary[]> {
-    const result = await this.client.request<ThreadListResult>("thread/list", {
+    const params: ThreadListParams = {
       ...(cwd ? { cwd } : {}),
       sourceKinds: ["cli", "vscode", "appServer"],
       archived: false,
       limit,
       sortKey: "updated_at",
       sortDirection: "desc",
-    });
+    };
+    const result = await this.client.request<ThreadListResponse>("thread/list", params);
     if (!Array.isArray(result.data)) throw new Error("thread/list response did not include data");
     return result.data.map(parseThread);
   }
 
   async read(threadId: string): Promise<ThreadSummary> {
-    const result = await this.client.request<ThreadReadResult>("thread/read", {
+    const params: ThreadReadParams = {
       threadId,
       includeTurns: false,
-    });
+    };
+    const result = await this.client.request<ThreadReadResponse>("thread/read", params);
     return parseThread(result.thread);
   }
 }

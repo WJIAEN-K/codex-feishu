@@ -1,5 +1,9 @@
 import type { CodexAppServerClient } from "./client.js";
-import { resultId, type TurnInput, type TurnResult } from "./protocol.js";
+import type { TurnInterruptParams } from "./generated/v2/TurnInterruptParams.js";
+import type { TurnInterruptResponse } from "./generated/v2/TurnInterruptResponse.js";
+import type { TurnStartParams } from "./generated/v2/TurnStartParams.js";
+import type { TurnStartResponse } from "./generated/v2/TurnStartResponse.js";
+import { resultId, type TurnInput } from "./protocol.js";
 
 export interface StartTurnOptions {
   threadId: string;
@@ -12,13 +16,14 @@ export interface StartTurnOptions {
 type RpcClient = Pick<CodexAppServerClient, "request">;
 
 export async function startTurn(client: RpcClient, options: StartTurnOptions): Promise<string> {
-  const result = await client.request<TurnResult>("turn/start", {
+  const params: TurnStartParams = {
     threadId: options.threadId,
     input: options.input,
     cwd: options.cwd,
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { effort: options.reasoningEffort } : {}),
-  });
+  };
+  const result = await client.request<TurnStartResponse>("turn/start", params);
   return resultId(result, "turn");
 }
 
@@ -27,5 +32,6 @@ export async function interruptTurn(
   threadId: string,
   turnId: string,
 ): Promise<void> {
-  await client.request("turn/interrupt", { threadId, turnId });
+  const params: TurnInterruptParams = { threadId, turnId };
+  await client.request<TurnInterruptResponse>("turn/interrupt", params);
 }

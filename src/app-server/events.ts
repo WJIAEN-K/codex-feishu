@@ -1,5 +1,9 @@
 import type { JsonRpcNotification } from "./jsonrpc.js";
 import { isObject } from "./jsonrpc.js";
+import type { ServerNotification } from "./generated/ServerNotification.js";
+
+type ParamsFor<Method extends ServerNotification["method"]> =
+  Extract<ServerNotification, { method: Method }>["params"];
 
 interface EventBase {
   chatId: string;
@@ -10,6 +14,7 @@ export type AgentEvent =
   | (EventBase & { type: "thread_started"; threadId: string })
   | (EventBase & { type: "turn_started"; turnId: string })
   | (EventBase & { type: "text_delta"; turnId?: string; text: string })
+  | (EventBase & { type: "text_completed"; turnId?: string; text: string })
   | (EventBase & {
       type: "tool_started";
       turnId?: string;
@@ -54,11 +59,13 @@ export class AppServerEventMapper {
       case "turn/started":
         return turnId ? [{ type: "turn_started", chatId, threadId, turnId }] : [];
       case "item/agentMessage/delta": {
-        const text = firstString(params.delta, params.text);
+        const typed = params as Partial<ParamsFor<"item/agentMessage/delta">>;
+        const text = firstString(typed.delta, params.text);
         return text ? [{ type: "text_delta", chatId, threadId, turnId, text }] : [];
       }
       case "item/started": {
-        const item = isObject(params.item) ? params.item : params;
+        const typed = params as Partial<ParamsFor<"item/started">>;
+        const item = isObject(typed.item) ? typed.item : params;
         if (isAgentMessage(item)) return [];
         const itemId = extractId(item, "itemId", "item") ?? firstString(item.id);
         if (!itemId) return [];
@@ -74,17 +81,22 @@ export class AppServerEventMapper {
         }];
       }
       case "item/completed": {
-        const item = isObject(params.item) ? params.item : params;
-        if (isAgentMessage(item)) return [];
+        const typed = params as Partial<ParamsFor<"item/completed">>;
+        const item = isObject(typed.item) ? typed.item : params;
+        if (isAgentMessage(item)) {
+          const text = agentMessageText(item);
+          return text ? [{ type: "text_completed", chatId, threadId, turnId, text }] : [];
+        }
         const itemId = extractId(item, "itemId", "item") ?? firstString(item.id);
         if (!itemId) return [];
-        const status = firstString(item.status, params.status)?.toLowerCase();
+        const status = firstString((item as Record<string, unknown>).status, params.status)?.toLowerCase();
         const success = status !== "failed" && status !== "error" && status !== "cancelled";
         return [{ type: "tool_completed", chatId, threadId, turnId, itemId, success }];
       }
       case "turn/completed": {
         if (!turnId) return [];
-        const turn = isObject(params.turn) ? params.turn : params;
+        const typed = params as Partial<ParamsFor<"turn/completed">>;
+        const turn = isObject(typed.turn) ? typed.turn : params;
         const status = firstString(turn.status, params.status)?.toLowerCase();
         const error = errorMessage(turn.error ?? params.error);
         const success = !error && status !== "failed" && status !== "error" && status !== "cancelled";
@@ -110,6 +122,16 @@ export class AppServerEventMapper {
         return [];
     }
   }
+}
+
+function agentMessageText(item: Record<string, unknown>): string | undefined {
+  const direct = firstString(item.text, item.message, item.content);
+  if (direct) return direct;
+  if (!Array.isArray(item.content)) return undefined;
+  const parts = item.content
+    .map((part) => isObject(part) ? firstString(part.text, part.content) : undefined)
+    .filter((part): part is string => Boolean(part));
+  return parts.length > 0 ? parts.join("") : undefined;
 }
 
 function extractId(value: Record<string, unknown>, directKey: string, nestedKey: string): string | undefined {

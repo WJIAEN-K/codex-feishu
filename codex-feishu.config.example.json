@@ -26,6 +26,9 @@
   "storage": {
     "sessionDatabasePath": "/absolute/path/to/project/.codex-feishu/sessions.sqlite"
   },
+  "queue": {
+    "maxPerChat": 20
+  },
   "runtime": {
     "logLevel": "info"
   }

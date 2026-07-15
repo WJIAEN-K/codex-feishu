@@ -14,6 +14,10 @@ export class MemorySessionStore implements SessionStore {
     return session ? { ...session } : null;
   }
 
+  async list(): Promise<ChatSession[]> {
+    return [...this.sessions.values()].map((session) => ({ ...session }));
+  }
+
   async set(session: ChatSession): Promise<void> {
     this.sessions.set(session.chatId, { ...session });
   }

@@ -34,6 +34,22 @@ describe("AppServerEventMapper", () => {
     } })[0]).toMatchObject({ type: "tool_completed", success: false });
   });
 
+  it("uses the completed agent message when no delta is emitted", () => {
+    const mapper = new AppServerEventMapper();
+    mapper.registerThread("chat-1", "thread-1");
+    expect(mapper.map({ method: "item/completed", params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { id: "message-1", type: "agentMessage", text: "final answer" },
+    } })).toEqual([{
+      type: "text_completed",
+      chatId: "chat-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      text: "final answer",
+    }]);
+  });
+
   it("maps errors and ignores unknown threads or methods", () => {
     const mapper = new AppServerEventMapper();
     mapper.registerThread("chat-1", "thread-1");

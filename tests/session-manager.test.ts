@@ -26,9 +26,9 @@ function setup() {
 describe("SessionManager", () => {
   it("maps one chat to one thread and reuses it for continuous turns", async () => {
     const { manager, request } = setup();
-    const first = await manager.beginTurn("chat-1", [{ type: "text", text: "one" }]);
+    const first = await manager.beginTurn("chat-1", [{ type: "text", text: "one", text_elements: [] }]);
     await manager.updateStatus("chat-1", "idle");
-    const second = await manager.beginTurn("chat-1", [{ type: "text", text: "two" }]);
+    const second = await manager.beginTurn("chat-1", [{ type: "text", text: "two", text_elements: [] }]);
 
     expect(first.threadId).toBe("thread-1");
     expect(second.threadId).toBe("thread-1");
@@ -46,8 +46,10 @@ describe("SessionManager", () => {
 
   it("interrupts the active turn and rejects overlapping turns", async () => {
     const { manager, request } = setup();
-    await manager.beginTurn("chat-1", [{ type: "text", text: "run" }]);
-    await expect(manager.beginTurn("chat-1", [{ type: "text", text: "overlap" }])).rejects.toThrow("active");
+    await manager.beginTurn("chat-1", [{ type: "text", text: "run", text_elements: [] }]);
+    await expect(manager.beginTurn("chat-1", [{
+      type: "text", text: "overlap", text_elements: [],
+    }])).rejects.toThrow("active");
     await expect(manager.interrupt("chat-1")).resolves.toBe(true);
     expect(request).toHaveBeenCalledWith("turn/interrupt", {
       threadId: "thread-1",
@@ -70,7 +72,7 @@ describe("CommandRouter", () => {
   it("interrupts an active turn before /new replaces its thread", async () => {
     const { manager, request } = setup();
     const router = new CommandRouter(manager, { getStatus: () => "ready" }, {} as WorkspaceRegistry);
-    await manager.beginTurn("chat-1", [{ type: "text", text: "running" }]);
+    await manager.beginTurn("chat-1", [{ type: "text", text: "running", text_elements: [] }]);
 
     await expect(router.execute(context, "/new")).resolves.toBe("已创建新的 Codex 会话。");
     expect(request).toHaveBeenCalledWith("turn/interrupt", {

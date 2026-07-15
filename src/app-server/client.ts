@@ -12,8 +12,9 @@ import {
   JsonRpcTimeoutError,
   parseJsonRpcLine,
 } from "./jsonrpc.js";
-import type { InitializeParams } from "./protocol.js";
+import type { InitializeParams } from "./generated/InitializeParams.js";
 import { buildAppServerSpawnSpec, terminateAppServerProcess } from "./process.js";
+import { JsonRpcWriteQueue } from "./write-queue.js";
 
 export type AppServerStatus = "stopped" | "starting" | "ready" | "error";
 
@@ -43,6 +44,7 @@ export class CodexAppServerClient {
     "command" | "args" | "env" | "requestTimeoutMs" | "clientVersion">>
     & Pick<CodexAppServerClientOptions, "cwd">;
   private child: ChildProcessWithoutNullStreams | null = null;
+  private writeQueue: JsonRpcWriteQueue | null = null;
   private stdoutReader: ReadLineInterface | null = null;
   private stderrReader: ReadLineInterface | null = null;
   private nextRequestId = 1;
@@ -84,6 +86,7 @@ export class CodexAppServerClient {
         windowsHide: spawnSpec.windowsHide,
       });
       this.child = child;
+      this.writeQueue = new JsonRpcWriteQueue(child.stdin);
       this.attachProcess(child);
       await this.waitForSpawn(child);
 
@@ -93,7 +96,7 @@ export class CodexAppServerClient {
           title: "Codex Feishu Bridge",
           version: this.options.clientVersion,
         },
-        capabilities: { experimentalApi: true },
+        capabilities: { experimentalApi: true, requestAttestation: false },
       };
       await this.request("initialize", params);
       this.notify("initialized", {});
@@ -116,6 +119,8 @@ export class CodexAppServerClient {
     this.status = "stopped";
     this.rejectPending(new Error("Codex App Server stopped"));
     this.closeReaders();
+    this.writeQueue?.close(new Error("Codex App Server stopped"));
+    this.writeQueue = null;
     this.child = null;
 
     if (!child || child.exitCode !== null || child.signalCode !== null) return;
@@ -143,26 +148,26 @@ export class CodexAppServerClient {
         timeout,
       });
 
-      try {
-        this.write({ id, method, ...(params === undefined ? {} : { params }) });
-      } catch (error) {
+      void this.write({ id, method, ...(params === undefined ? {} : { params }) }).catch((error: unknown) => {
         clearTimeout(timeout);
         this.pending.delete(id);
         reject(this.normalizeError(error));
-      }
+      });
     });
   }
 
   notify(method: string, params?: unknown): void {
-    this.write({ method, ...(params === undefined ? {} : { params }) });
+    void this.write({ method, ...(params === undefined ? {} : { params }) })
+      .catch((error: unknown) => this.emitError(this.normalizeError(error)));
   }
 
   respond(id: JsonRpcId, result: unknown): void {
-    this.write({ id, result });
+    void this.write({ id, result }).catch((error: unknown) => this.emitError(this.normalizeError(error)));
   }
 
   respondError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
-    this.write({ id, error: { code, message, ...(data === undefined ? {} : { data }) } });
+    void this.write({ id, error: { code, message, ...(data === undefined ? {} : { data }) } })
+      .catch((error: unknown) => this.emitError(this.normalizeError(error)));
   }
 
   onNotification(handler: NotificationHandler): () => void {
@@ -201,6 +206,8 @@ export class CodexAppServerClient {
       if (child !== this.child) return;
       const expected = this.stopping;
       this.child = null;
+      this.writeQueue?.close(new Error("Codex App Server exited"));
+      this.writeQueue = null;
       this.closeReaders();
       if (expected) {
         this.status = "stopped";
@@ -257,12 +264,9 @@ export class CodexAppServerClient {
     }
   }
 
-  private write(message: unknown): void {
-    const child = this.child;
-    if (!child || child.stdin.destroyed || !child.stdin.writable) {
-      throw new Error("Codex App Server stdin is not writable");
-    }
-    child.stdin.write(`${JSON.stringify(message)}\n`);
+  private write(message: unknown): Promise<void> {
+    if (!this.writeQueue) return Promise.reject(new Error("Codex App Server stdin is not writable"));
+    return this.writeQueue.enqueue(message);
   }
 
   private handleProcessFailure(error: Error): void {

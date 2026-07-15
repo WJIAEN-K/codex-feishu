@@ -36,7 +36,11 @@ try {
     const turnId = await startTurn(client, {
       threadId,
       cwd: process.cwd(),
-      input: [{ type: "text", text: "Reply exactly PONG. Do not use tools or modify files." }],
+      input: [{
+        type: "text",
+        text: "Reply exactly PONG. Do not use tools or modify files.",
+        text_elements: [],
+      }],
     });
     let verificationTimer: ReturnType<typeof setTimeout> | undefined;
     try {

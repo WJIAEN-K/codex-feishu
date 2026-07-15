@@ -1,25 +1,22 @@
-export interface InitializeParams {
-  clientInfo: {
-    name: "codex_feishu";
-    title: "Codex Feishu Bridge";
-    version: string;
-  };
-  capabilities: {
-    experimentalApi: true;
-  };
-}
+import type { UserInput } from "./generated/v2/UserInput.js";
 
 export interface LocalImageInput {
   type: "localImage";
   path: string;
+  detail?: "auto" | "low" | "high" | "original";
 }
 
 export interface TextInput {
   type: "text";
   text: string;
+  text_elements: never[];
 }
 
 export type TurnInput = TextInput | LocalImageInput;
+
+// Fails compilation when a regenerated official schema becomes incompatible.
+type AssertTrue<Value extends true> = Value;
+type _OfficialTurnInputCompatibility = AssertTrue<TurnInput extends UserInput ? true : false>;
 
 export interface ThreadResult {
   thread?: { id?: string };

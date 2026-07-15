@@ -21,6 +21,7 @@ export class SqliteSessionStore implements SessionStore {
   private readonly database: Database.Database;
   private readonly selectSession: Database.Statement<[string], SessionRow>;
   private readonly selectSessionByThread: Database.Statement<[string], SessionRow>;
+  private readonly selectSessions: Database.Statement<[], SessionRow>;
   private readonly upsertSession: Database.Statement;
   private readonly deleteSession: Database.Statement<[string]>;
 
@@ -54,6 +55,9 @@ export class SqliteSessionStore implements SessionStore {
     this.selectSessionByThread = this.database.prepare<[string], SessionRow>(
       "SELECT * FROM chat_sessions WHERE thread_id = ? LIMIT 1",
     );
+    this.selectSessions = this.database.prepare<[], SessionRow>(
+      "SELECT * FROM chat_sessions ORDER BY updated_at DESC",
+    );
     this.upsertSession = this.database.prepare(`
       INSERT INTO chat_sessions (
         chat_id, thread_id, cwd, binding_mode, status, active_turn_id, created_at, updated_at
@@ -80,6 +84,10 @@ export class SqliteSessionStore implements SessionStore {
   async getByThreadId(threadId: string): Promise<ChatSession | null> {
     const row = this.selectSessionByThread.get(threadId);
     return row ? fromRow(row) : null;
+  }
+
+  async list(): Promise<ChatSession[]> {
+    return this.selectSessions.all().map(fromRow);
   }
 
   async set(session: ChatSession): Promise<void> {

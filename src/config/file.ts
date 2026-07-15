@@ -41,6 +41,9 @@ export interface JsonAppConfig {
   storage: {
     sessionDatabasePath: string;
   };
+  queue: {
+    maxPerChat: number;
+  };
   runtime: {
     logLevel: LogLevel;
   };
@@ -59,6 +62,7 @@ export interface AppConfig {
     allowedRoots: string[];
   };
   sessionDatabasePath: string;
+  maxQueuedPerChat: number;
   logLevel: LogLevel;
   json: JsonAppConfig;
 }
@@ -182,6 +186,7 @@ export function createDefaultJsonConfig(cwd = process.cwd()): JsonAppConfig {
     storage: {
       sessionDatabasePath: join(defaultPath, ".codex-feishu", "sessions.sqlite"),
     },
+    queue: { maxPerChat: 20 },
     runtime: { logLevel: "info" },
   };
 }
@@ -196,6 +201,7 @@ export function mergeJsonConfigDraft(raw: unknown, cwd = process.cwd()): JsonApp
   const codex = isRecord(raw.codex) ? raw.codex : {};
   const workspace = isRecord(raw.workspace) ? raw.workspace : {};
   const storage = isRecord(raw.storage) ? raw.storage : {};
+  const queue = isRecord(raw.queue) ? raw.queue : {};
   const runtime = isRecord(raw.runtime) ? raw.runtime : {};
   return {
     ...defaults,
@@ -205,6 +211,7 @@ export function mergeJsonConfigDraft(raw: unknown, cwd = process.cwd()): JsonApp
     codex: { ...defaults.codex, ...codex },
     workspace: { ...defaults.workspace, ...workspace },
     storage: { ...defaults.storage, ...storage },
+    queue: { ...defaults.queue, ...queue },
     runtime: { ...defaults.runtime, ...runtime },
   } as JsonAppConfig;
 }
@@ -264,6 +271,9 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
     };
   }
   const sessionDatabasePath = absolutePath(draft.storage.sessionDatabasePath, "storage.sessionDatabasePath");
+  if (!Number.isSafeInteger(draft.queue.maxPerChat) || draft.queue.maxPerChat <= 0) {
+    throw new Error("queue.maxPerChat 必须是正整数");
+  }
   if (!(["debug", "info", "warn", "error"] as const).includes(draft.runtime.logLevel)) {
     throw new Error("runtime.logLevel 必须是 debug、info、warn 或 error");
   }
@@ -294,6 +304,7 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
       projects,
     },
     storage: { sessionDatabasePath },
+    queue: { maxPerChat: draft.queue.maxPerChat },
     runtime: { logLevel: draft.runtime.logLevel },
   };
 }
@@ -318,6 +329,7 @@ function toAppConfig(json: JsonAppConfig): AppConfig {
       allowedRoots: [...json.workspace.allowedRoots],
     },
     sessionDatabasePath: json.storage.sessionDatabasePath,
+    maxQueuedPerChat: json.queue.maxPerChat,
     logLevel: json.runtime.logLevel,
     json,
   };

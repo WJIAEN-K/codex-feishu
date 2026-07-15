@@ -111,4 +111,41 @@ describe("SqliteSessionStore", () => {
     expect(await store.get("chat-1")).not.toHaveProperty("activeTurnId");
     store.close();
   });
+
+  it("recovers all persisted threads after the App Server process restarts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-feishu-recover-"));
+    temporaryDirectories.push(directory);
+    const store = new SqliteSessionStore(join(directory, "sessions.sqlite"));
+    await store.set({
+      chatId: "chat-1",
+      threadId: "thread-1",
+      cwd: "/workspace/one",
+      bindingMode: "owned",
+      status: "idle",
+      createdAt: 100,
+      updatedAt: 200,
+    });
+    await store.set({
+      chatId: "chat-2",
+      threadId: "thread-2",
+      cwd: "/workspace/two",
+      bindingMode: "attached",
+      status: "running",
+      activeTurnId: "stale-turn",
+      createdAt: 100,
+      updatedAt: 300,
+    });
+    const request = vi.fn(async () => ({}));
+    const manager = new SessionManager(
+      store,
+      { request } as unknown as Pick<CodexAppServerClient, "request">,
+      { cwd: "/workspace" },
+    );
+
+    await expect(manager.recoverAfterServerRestart()).resolves.toHaveLength(2);
+    expect(request).toHaveBeenCalledTimes(2);
+    await expect(store.get("chat-2")).resolves.toMatchObject({ status: "error" });
+    expect(await store.get("chat-2")).not.toHaveProperty("activeTurnId");
+    store.close();
+  });
 });

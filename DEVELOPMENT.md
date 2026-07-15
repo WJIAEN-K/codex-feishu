@@ -12,6 +12,8 @@ FeishuClient ──► CodexFeishuBridge ──► SessionManager
               AppServerEventMapper     SQLiteSessionStore
                        │
                        ▼
+              CodexAppServerSupervisor
+                       │
               CodexAppServerClient
                        │ JSON-RPC + JSONL over stdio
                        ▼
@@ -51,7 +53,9 @@ JSON 文件使用临时文件加原子 rename 写入，并设置为 `0600`。App
 3. 发送 `initialize`，等待成功响应。
 4. 发送 `initialized` 通知。
 5. 初始化完成后才允许 Thread 和 Turn 请求。
-6. 退出、超时或协议错误时拒绝相关 pending request。
+6. stdin 帧通过 `JsonRpcWriteQueue` 串行写入并等待回调，避免背压时交错或静默丢失。
+7. App Server 异常退出时拒绝 pending request，并按 1s、2s、5s、10s、30s 退避重启。
+8. 重启成功后重新执行 initialize/initialized，并 resume SQLite 中可恢复的 Thread。
 
 停止服务时，macOS/Linux 使用进程信号；Windows 使用 `taskkill /T` 清理 `cmd.exe → codex.cmd → node/codex` 的完整进程树，等待实际退出，超时后追加 `/F` 强制退出。Windows CI 还会运行真实 `.cmd` fixture 验证启动、JSON-RPC 和停止链路。
 
@@ -64,6 +68,7 @@ JSON 文件使用临时文件加原子 rename 写入，并设置为 `0600`。App
 所有 App Server 通知先在 `AppServerEventMapper` 中转换为 `AgentEvent`。Bridge 不读取原始 Codex 事件字段。
 
 - `item/agentMessage/delta`：累积并按节流窗口刷新流式卡片。
+- `item/completed` 中的 `agentMessage`：在没有 delta 或 delta 不完整时补齐最终文本。
 - `item/started` / `item/completed`：更新同一张工具进度卡片。
 - `turn/completed`：发送完整分块文本、清理 Typing 和 active Turn。
 - `error`：发送明确错误并将 Session 置为 error，后续消息仍可继续。
@@ -75,7 +80,7 @@ JSON 文件使用临时文件加原子 rename 写入，并设置为 `0600`。App
 - `item/commandExecution/requestApproval`
 - `item/fileChange/requestApproval`
 
-请求通过 JSON-RPC `id` 与飞书按钮绑定，响应为 `{ "decision": "accept" }` 或 `{ "decision": "decline" }`。Thread 默认使用：
+请求通过 JSON-RPC `id` 与飞书按钮绑定，同时记录发起当前任务的 Open ID。卡片回调中的操作者 Open ID 必须与任务发起人一致，响应才会发送给 App Server；群聊中的其他成员点击会被拒绝。响应为 `{ "decision": "accept" }` 或 `{ "decision": "decline" }`。Thread 默认使用：
 
 ```text
 approvalPolicy = on-request
@@ -86,13 +91,15 @@ sandbox = workspace-write
 可用本机 Codex 生成协议类型进行核对：
 
 ```bash
-codex app-server generate-ts --experimental --out /tmp/codex-app-server-schema
+npm run generate:app-server-types
 ```
 
 ## 测试策略
 
 - `jsonrpc.test.ts`：解析、错误响应和无效消息。
 - `app-server-client.test.ts`：真实子进程握手、超时、退出和重复响应。
+- `app-server-supervisor.test.ts`：异常退出、自动重启和 Thread 恢复回调。
+- `write-queue.test.ts`：异步背压下的 JSON-RPC 帧顺序。
 - `session-manager.test.ts`：Thread 复用、替换、并发保护和中断。
 - `event-mapper.test.ts`：文本、工具、完成和错误事件映射。
 - `bridge.test.ts`：完整消息链、排队、媒体、卡片、分块、审批和清理。

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { CodexAppServerClient } from "./app-server/client.js";
+import { CodexAppServerSupervisor } from "./app-server/supervisor.js";
 import { CodexFeishuBridge } from "./bridge/codex-feishu-bridge.js";
 import { CommandRouter } from "./commands/index.js";
 import {
@@ -24,12 +25,13 @@ interface RunningService {
 async function startService(config: AppConfig, configFile: ConfigFile): Promise<RunningService> {
   const logger = new Logger(config.logLevel);
   const feishu = new FeishuClient(config.feishu);
-  const appServer = new CodexAppServerClient({
+  const appServerClient = new CodexAppServerClient({
     command: config.codex.command,
     args: config.codex.args,
     cwd: config.codex.workingDirectory,
     requestTimeoutMs: config.codex.requestTimeoutMs,
   });
+  const appServer = new CodexAppServerSupervisor(appServerClient);
   const sessionStore = new SqliteSessionStore(config.sessionDatabasePath);
   try {
     const workspaceStore = new JsonWorkspaceStore(configFile);
@@ -44,8 +46,14 @@ async function startService(config: AppConfig, configFile: ConfigFile): Promise<
       model: config.codex.model,
       reasoningEffort: config.codex.reasoningEffort,
     });
+    appServer.onRecovered(async () => {
+      const recovered = await sessions.recoverAfterServerRestart();
+      logger.info(`Codex App Server recovered ${recovered.length} persisted thread(s)`);
+    });
     const commands = new CommandRouter(sessions, appServer, workspaces);
-    const bridge = new CodexFeishuBridge(feishu, appServer, sessions, commands, logger);
+    const bridge = new CodexFeishuBridge(feishu, appServer, sessions, commands, logger, {
+      maxQueuedPerChat: config.maxQueuedPerChat,
+    });
     await bridge.start();
     let stopped = false;
     logger.info("codex-feishu service started");

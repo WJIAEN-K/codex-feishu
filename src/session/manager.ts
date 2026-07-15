@@ -79,6 +79,27 @@ export class SessionManager {
     return session;
   }
 
+  async recoverAfterServerRestart(): Promise<ChatSession[]> {
+    this.attachedThreads.clear();
+    const sessions = await this.store.list();
+    const recovered = await Promise.all(sessions.map(async (session) => {
+      try {
+        await resumeThread(this.client, session.threadId, { cwd: session.cwd });
+        this.attachedThreads.add(session.threadId);
+        if (session.status === "running" || session.status === "waiting_approval") {
+          session.status = "error";
+          delete session.activeTurnId;
+          session.updatedAt = Date.now();
+          await this.store.set(session);
+        }
+        return session;
+      } catch {
+        return null;
+      }
+    }));
+    return recovered.filter((session): session is ChatSession => session !== null);
+  }
+
   listThreads(cwd?: string): Promise<ThreadSummary[]> {
     return this.threads.list(cwd);
   }

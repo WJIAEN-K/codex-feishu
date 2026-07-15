@@ -161,14 +161,20 @@ export class FeishuClient implements FeishuPort {
           const value = data?.action?.value;
           const action = value?.action;
           const requestId = value?.requestId;
+          const operatorOpenId = data?.operator?.open_id
+            ?? data?.operator?.openId
+            ?? data?.operator_open_id;
           if (
             this.onCardActionCallback
             && (action === "approve" || action === "reject")
             && typeof requestId === "string"
+            && typeof operatorOpenId === "string"
+            && operatorOpenId.length > 0
           ) {
             await this.onCardActionCallback({
               action,
               requestId,
+              operatorOpenId,
               messageId: data?.context?.open_message_id ?? data?.open_message_id,
             });
           }
