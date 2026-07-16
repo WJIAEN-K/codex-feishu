@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
 
 import type { FeishuConfig } from "../types.js";
 import type { LogLevel } from "../utils/logger.js";
@@ -32,6 +33,8 @@ export interface JsonAppConfig {
     model?: string;
     reasoningEffort?: string;
     requestTimeoutMs: number;
+    localDiscoveryEnabled: boolean;
+    localStateDatabasePath: string;
   };
   workspace: {
     defaultPath: string;
@@ -44,8 +47,34 @@ export interface JsonAppConfig {
   queue: {
     maxPerChat: number;
   };
+  attachments: {
+    enabled: boolean;
+    maxFileBytes: number;
+  };
+  sessions: {
+    groupMode: "per-user" | "shared";
+    idleResetMs: number;
+  };
+  scheduler: {
+    enabled: boolean;
+    pollIntervalMs: number;
+    retryDelayMs: number;
+    maxRetries: number;
+  };
+  localSync: {
+    enabled: boolean;
+    pollIntervalMs: number;
+    approvalTimeoutMs: number;
+  };
+  admin: {
+    enabled: boolean;
+    port: number;
+    authToken?: string;
+  };
   runtime: {
     logLevel: LogLevel;
+    turnDeadlineMs: number;
+    turnInterruptGraceMs: number;
   };
 }
 
@@ -60,9 +89,23 @@ export interface AppConfig {
     reasoningEffort?: string;
     requestTimeoutMs: number;
     allowedRoots: string[];
+    localDiscoveryEnabled: boolean;
+    localStateDatabasePath: string;
   };
   sessionDatabasePath: string;
   maxQueuedPerChat: number;
+  attachments: {
+    enabled: boolean;
+    maxFileBytes: number;
+  };
+  sessions: {
+    groupMode: "per-user" | "shared";
+    idleResetMs: number;
+  };
+  scheduler: JsonAppConfig["scheduler"];
+  localSync: JsonAppConfig["localSync"];
+  admin: JsonAppConfig["admin"];
+  runtime: JsonAppConfig["runtime"];
   logLevel: LogLevel;
   json: JsonAppConfig;
 }
@@ -177,6 +220,8 @@ export function createDefaultJsonConfig(cwd = process.cwd()): JsonAppConfig {
       command: "codex",
       args: ["app-server", "--stdio"],
       requestTimeoutMs: 120_000,
+      localDiscoveryEnabled: true,
+      localStateDatabasePath: join(homedir(), ".codex", "state_5.sqlite"),
     },
     workspace: {
       defaultPath,
@@ -187,7 +232,12 @@ export function createDefaultJsonConfig(cwd = process.cwd()): JsonAppConfig {
       sessionDatabasePath: join(defaultPath, ".codex-feishu", "sessions.sqlite"),
     },
     queue: { maxPerChat: 20 },
-    runtime: { logLevel: "info" },
+    attachments: { enabled: true, maxFileBytes: 50 * 1024 * 1024 },
+    sessions: { groupMode: "per-user", idleResetMs: 0 },
+    scheduler: { enabled: true, pollIntervalMs: 1_000, retryDelayMs: 60_000, maxRetries: 3 },
+    localSync: { enabled: true, pollIntervalMs: 750, approvalTimeoutMs: 300_000 },
+    admin: { enabled: true, port: 0 },
+    runtime: { logLevel: "info", turnDeadlineMs: 3_600_000, turnInterruptGraceMs: 10_000 },
   };
 }
 
@@ -202,6 +252,11 @@ export function mergeJsonConfigDraft(raw: unknown, cwd = process.cwd()): JsonApp
   const workspace = isRecord(raw.workspace) ? raw.workspace : {};
   const storage = isRecord(raw.storage) ? raw.storage : {};
   const queue = isRecord(raw.queue) ? raw.queue : {};
+  const attachments = isRecord(raw.attachments) ? raw.attachments : {};
+  const sessions = isRecord(raw.sessions) ? raw.sessions : {};
+  const scheduler = isRecord(raw.scheduler) ? raw.scheduler : {};
+  const localSync = isRecord(raw.localSync) ? raw.localSync : {};
+  const admin = isRecord(raw.admin) ? raw.admin : {};
   const runtime = isRecord(raw.runtime) ? raw.runtime : {};
   return {
     ...defaults,
@@ -212,6 +267,11 @@ export function mergeJsonConfigDraft(raw: unknown, cwd = process.cwd()): JsonApp
     workspace: { ...defaults.workspace, ...workspace },
     storage: { ...defaults.storage, ...storage },
     queue: { ...defaults.queue, ...queue },
+    attachments: { ...defaults.attachments, ...attachments },
+    sessions: { ...defaults.sessions, ...sessions },
+    scheduler: { ...defaults.scheduler, ...scheduler },
+    localSync: { ...defaults.localSync, ...localSync },
+    admin: { ...defaults.admin, ...admin },
     runtime: { ...defaults.runtime, ...runtime },
   } as JsonAppConfig;
 }
@@ -243,6 +303,13 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
   if (!Number.isSafeInteger(draft.codex.requestTimeoutMs) || draft.codex.requestTimeoutMs <= 0) {
     throw new Error("codex.requestTimeoutMs 必须是正整数");
   }
+  if (typeof draft.codex.localDiscoveryEnabled !== "boolean") {
+    throw new Error("codex.localDiscoveryEnabled 必须是布尔值");
+  }
+  const localStateDatabasePath = absolutePath(
+    draft.codex.localStateDatabasePath,
+    "codex.localStateDatabasePath",
+  );
   const defaultPath = absolutePath(draft.workspace.defaultPath, "workspace.defaultPath");
   if (!Array.isArray(draft.workspace.allowedRoots) || draft.workspace.allowedRoots.length === 0) {
     throw new Error("workspace.allowedRoots 至少需要一个路径");
@@ -274,6 +341,47 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
   if (!Number.isSafeInteger(draft.queue.maxPerChat) || draft.queue.maxPerChat <= 0) {
     throw new Error("queue.maxPerChat 必须是正整数");
   }
+  if (typeof draft.attachments.enabled !== "boolean") {
+    throw new Error("attachments.enabled 必须是布尔值");
+  }
+  if (!Number.isSafeInteger(draft.attachments.maxFileBytes) || draft.attachments.maxFileBytes <= 0) {
+    throw new Error("attachments.maxFileBytes 必须是正整数");
+  }
+  if (draft.sessions.groupMode !== "per-user" && draft.sessions.groupMode !== "shared") {
+    throw new Error("sessions.groupMode 必须是 per-user 或 shared");
+  }
+  if (!Number.isSafeInteger(draft.sessions.idleResetMs) || draft.sessions.idleResetMs < 0) {
+    throw new Error("sessions.idleResetMs 必须是非负整数");
+  }
+  if (typeof draft.scheduler.enabled !== "boolean") throw new Error("scheduler.enabled 必须是布尔值");
+  for (const key of ["pollIntervalMs", "retryDelayMs"] as const) {
+    if (!Number.isSafeInteger(draft.scheduler[key]) || draft.scheduler[key] <= 0) {
+      throw new Error(`scheduler.${key} 必须是正整数`);
+    }
+  }
+  if (!Number.isSafeInteger(draft.scheduler.maxRetries) || draft.scheduler.maxRetries < 0) {
+    throw new Error("scheduler.maxRetries 必须是非负整数");
+  }
+  if (typeof draft.localSync.enabled !== "boolean") throw new Error("localSync.enabled 必须是布尔值");
+  if (!Number.isSafeInteger(draft.localSync.pollIntervalMs) || draft.localSync.pollIntervalMs < 200) {
+    throw new Error("localSync.pollIntervalMs 必须是不小于 200 的整数");
+  }
+  if (!Number.isSafeInteger(draft.localSync.approvalTimeoutMs) || draft.localSync.approvalTimeoutMs < 1_000) {
+    throw new Error("localSync.approvalTimeoutMs 必须是不小于 1000 的整数");
+  }
+  if (typeof draft.admin.enabled !== "boolean") throw new Error("admin.enabled 必须是布尔值");
+  if (!Number.isSafeInteger(draft.admin.port) || draft.admin.port < 0 || draft.admin.port > 65_535) {
+    throw new Error("admin.port 必须是 0 到 65535 的整数");
+  }
+  if (draft.admin.authToken !== undefined && !nonEmpty(draft.admin.authToken)) {
+    throw new Error("admin.authToken 设置后不能为空");
+  }
+  if (!Number.isSafeInteger(draft.runtime.turnDeadlineMs) || draft.runtime.turnDeadlineMs < 0) {
+    throw new Error("runtime.turnDeadlineMs 必须是非负整数");
+  }
+  if (!Number.isSafeInteger(draft.runtime.turnInterruptGraceMs) || draft.runtime.turnInterruptGraceMs <= 0) {
+    throw new Error("runtime.turnInterruptGraceMs 必须是正整数");
+  }
   if (!(["debug", "info", "warn", "error"] as const).includes(draft.runtime.logLevel)) {
     throw new Error("runtime.logLevel 必须是 debug、info、warn 或 error");
   }
@@ -297,6 +405,8 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
         ? { reasoningEffort: draft.codex.reasoningEffort.trim() }
         : {}),
       requestTimeoutMs: draft.codex.requestTimeoutMs,
+      localDiscoveryEnabled: draft.codex.localDiscoveryEnabled,
+      localStateDatabasePath,
     },
     workspace: {
       defaultPath,
@@ -305,7 +415,26 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
     },
     storage: { sessionDatabasePath },
     queue: { maxPerChat: draft.queue.maxPerChat },
-    runtime: { logLevel: draft.runtime.logLevel },
+    attachments: {
+      enabled: draft.attachments.enabled,
+      maxFileBytes: draft.attachments.maxFileBytes,
+    },
+    sessions: {
+      groupMode: draft.sessions.groupMode,
+      idleResetMs: draft.sessions.idleResetMs,
+    },
+    scheduler: { ...draft.scheduler },
+    localSync: { ...draft.localSync },
+    admin: {
+      enabled: draft.admin.enabled,
+      port: draft.admin.port,
+      ...(draft.admin.authToken ? { authToken: draft.admin.authToken.trim() } : {}),
+    },
+    runtime: {
+      logLevel: draft.runtime.logLevel,
+      turnDeadlineMs: draft.runtime.turnDeadlineMs,
+      turnInterruptGraceMs: draft.runtime.turnInterruptGraceMs,
+    },
   };
 }
 
@@ -327,9 +456,17 @@ function toAppConfig(json: JsonAppConfig): AppConfig {
       reasoningEffort: json.codex.reasoningEffort,
       requestTimeoutMs: json.codex.requestTimeoutMs,
       allowedRoots: [...json.workspace.allowedRoots],
+      localDiscoveryEnabled: json.codex.localDiscoveryEnabled,
+      localStateDatabasePath: json.codex.localStateDatabasePath,
     },
     sessionDatabasePath: json.storage.sessionDatabasePath,
     maxQueuedPerChat: json.queue.maxPerChat,
+    attachments: { ...json.attachments },
+    sessions: { ...json.sessions },
+    scheduler: { ...json.scheduler },
+    localSync: { ...json.localSync },
+    admin: { ...json.admin },
+    runtime: { ...json.runtime },
     logLevel: json.runtime.logLevel,
     json,
   };

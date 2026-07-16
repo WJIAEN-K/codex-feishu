@@ -52,6 +52,7 @@ describe("SqliteSessionStore", () => {
       bindingMode: "owned",
       status: "running",
       activeTurnId: "turn-1",
+      runtime: { model: "gpt-5.4", reasoningEffort: "high", mode: "plan" },
       createdAt: 100,
       updatedAt: 200,
     });
@@ -59,18 +60,57 @@ describe("SqliteSessionStore", () => {
 
     const second = new SqliteSessionStore(databasePath);
     await expect(second.get("chat-1")).resolves.toEqual({
+      id: "thread-1",
+      name: "会话 thread-1",
       chatId: "chat-1",
       threadId: "thread-1",
       cwd: "/workspace",
       bindingMode: "owned",
       status: "running",
       activeTurnId: "turn-1",
+      runtime: { model: "gpt-5.4", reasoningEffort: "high", mode: "plan" },
       createdAt: 100,
       updatedAt: 200,
     });
     await second.delete("chat-1");
     await expect(second.get("chat-1")).resolves.toBeNull();
     second.close();
+  });
+
+  it("stores multiple named sessions and switches the active session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "codex-feishu-named-sessions-"));
+    temporaryDirectories.push(directory);
+    const store = new SqliteSessionStore(join(directory, "sessions.sqlite"));
+    await store.set({
+      id: "session-1",
+      name: "后端",
+      chatId: "chat-1",
+      threadId: "thread-1",
+      cwd: "/workspace/backend",
+      bindingMode: "owned",
+      status: "idle",
+      createdAt: 100,
+      updatedAt: 200,
+    });
+    await store.set({
+      id: "session-2",
+      name: "前端",
+      chatId: "chat-1",
+      threadId: "thread-2",
+      cwd: "/workspace/frontend",
+      bindingMode: "owned",
+      status: "idle",
+      createdAt: 300,
+      updatedAt: 400,
+    });
+
+    await expect(store.list("chat-1")).resolves.toHaveLength(2);
+    await expect(store.get("chat-1")).resolves.toMatchObject({ name: "前端" });
+    await store.setActive("chat-1", "session-1");
+    await expect(store.get("chat-1")).resolves.toMatchObject({ name: "后端" });
+    await store.rename("session-1", "后端 API");
+    await expect(store.get("chat-1")).resolves.toMatchObject({ name: "后端 API" });
+    store.close();
   });
 
   it("resumes a persisted thread after service restart and clears stale running state", async () => {

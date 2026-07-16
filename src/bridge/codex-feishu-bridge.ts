@@ -1,17 +1,20 @@
-import {
-  mapApprovalRequest,
-  type ApprovalDecision,
-  type ApprovalRequest,
-} from "../app-server/approvals.js";
 import type { CodexAppServerClient } from "../app-server/client.js";
 import { AppServerEventMapper, type AgentEvent } from "../app-server/events.js";
+import {
+  buildInteractiveResponse,
+  parseInteractiveRequest,
+  type InteractiveAnswers,
+  type InteractiveRequest,
+  type InteractiveResolution,
+} from "../app-server/interactive-requests.js";
 import type { JsonRpcId, JsonRpcNotification, JsonRpcRequest } from "../app-server/jsonrpc.js";
 import type { TurnInput } from "../app-server/protocol.js";
+import type { AttachmentDispatcher } from "../attachments/dispatcher.js";
 import type { CommandRouter } from "../commands/index.js";
 import {
-  approvalCard,
-  approvalResolvedCard,
   finalCard,
+  interactiveRequestCard,
+  interactiveResolvedCard,
   progressCard,
   streamingCard,
   type ToolProgressEntry,
@@ -20,6 +23,7 @@ import { splitText } from "../feishu/messages.js";
 import type { FeishuCardAction, FeishuPort, InboundResource } from "../feishu/types.js";
 import type { SessionManager } from "../session/manager.js";
 import type { Logger } from "../utils/logger.js";
+import { unlink } from "node:fs/promises";
 
 type AppServerPort = Pick<CodexAppServerClient,
   | "start"
@@ -34,15 +38,19 @@ type AppServerPort = Pick<CodexAppServerClient,
 
 interface InboundMessage {
   chatId: string;
+  conversationId: string;
   messageId: string;
   text: string;
   chatType: "p2p" | "group";
   senderOpenId: string;
   resources: InboundResource[];
+  scheduled?: boolean;
+  completion?: { resolve: () => void; reject: (error: Error) => void };
 }
 
 interface TurnRuntime {
   chatId: string;
+  conversationId: string;
   messageId: string;
   threadId: string;
   turnId?: string;
@@ -55,20 +63,37 @@ interface TurnRuntime {
   flushChain: Promise<void>;
   progressChain: Promise<void>;
   finishing: boolean;
-  done: Promise<void>;
-  resolveDone: () => void;
+  done: Promise<boolean>;
+  resolveDone: (success: boolean) => void;
+  downloadedPaths: string[];
+  attachmentToken?: string;
+  deadlineTimer?: ReturnType<typeof setTimeout>;
+  deadlineGraceTimer?: ReturnType<typeof setTimeout>;
 }
 
-interface PendingApproval {
-  request: ApprovalRequest;
+interface PendingInteractive {
+  request: InteractiveRequest;
   chatId: string;
+  conversationId: string;
   messageId: string | null;
   ownerOpenId: string;
+  answers: InteractiveAnswers;
+  questionIndex: number;
+  timeout?: ReturnType<typeof setTimeout>;
 }
 
 export interface CodexFeishuBridgeOptions {
   streamFlushMs?: number;
   maxQueuedPerChat?: number;
+  attachmentDispatcher?: AttachmentDispatcher;
+  attachmentEndpoint?: string;
+  attachmentCommand?: string;
+  groupSessionMode?: "per-user" | "shared";
+  turnDeadlineMs?: number;
+  turnInterruptGraceMs?: number;
+  externalCardActionHandler?: (action: FeishuCardAction) => Promise<boolean>;
+  onManagedTurnStart?: (threadId: string) => void;
+  onManagedTurnFinished?: (threadId: string) => Promise<void>;
 }
 
 export class CodexFeishuBridge {
@@ -77,13 +102,24 @@ export class CodexFeishuBridge {
   private readonly processingChats = new Set<string>();
   private readonly runtimes = new Map<string, TurnRuntime>();
   private readonly eventChains = new Map<string, Promise<void>>();
-  private readonly pendingApprovals = new Map<string, PendingApproval>();
+  private readonly pendingInteractions = new Map<string, PendingInteractive>();
+  private readonly pendingByChat = new Map<string, string>();
   private readonly streamFlushMs: number;
   private readonly maxQueuedPerChat: number;
+  private readonly attachmentDispatcher?: AttachmentDispatcher;
+  private readonly attachmentEndpoint?: string;
+  private readonly attachmentCommand: string;
+  private readonly groupSessionMode: "per-user" | "shared";
+  private readonly turnDeadlineMs: number;
+  private readonly turnInterruptGraceMs: number;
+  private readonly externalCardActionHandler?: (action: FeishuCardAction) => Promise<boolean>;
+  private readonly onManagedTurnStart?: (threadId: string) => void;
+  private readonly onManagedTurnFinished?: (threadId: string) => Promise<void>;
   private unsubscribeNotification?: () => void;
   private unsubscribeError?: () => void;
   private unsubscribeStderr?: () => void;
   private unsubscribeRequest?: () => void;
+  private stopping = false;
 
   constructor(
     private readonly feishu: FeishuPort,
@@ -95,9 +131,19 @@ export class CodexFeishuBridge {
   ) {
     this.streamFlushMs = options.streamFlushMs ?? 750;
     this.maxQueuedPerChat = options.maxQueuedPerChat ?? 20;
+    this.attachmentDispatcher = options.attachmentDispatcher;
+    this.attachmentEndpoint = options.attachmentEndpoint;
+    this.attachmentCommand = options.attachmentCommand ?? defaultAttachmentCommand();
+    this.groupSessionMode = options.groupSessionMode ?? "per-user";
+    this.turnDeadlineMs = options.turnDeadlineMs ?? 0;
+    this.turnInterruptGraceMs = options.turnInterruptGraceMs ?? 10_000;
+    this.externalCardActionHandler = options.externalCardActionHandler;
+    this.onManagedTurnStart = options.onManagedTurnStart;
+    this.onManagedTurnFinished = options.onManagedTurnFinished;
   }
 
   async start(): Promise<void> {
+    this.stopping = false;
     this.unsubscribeNotification = this.appServer.onNotification((message) => this.onNotification(message));
     this.unsubscribeRequest = this.appServer.onRequest((request) => {
       void this.handleServerRequest(request).catch((error: unknown) => {
@@ -114,7 +160,21 @@ export class CodexFeishuBridge {
     this.feishu.setOnStatusChange((status) => this.logger.info(`Feishu status: ${status}`));
     this.feishu.setOnCardAction((action) => this.handleCardAction(action));
     this.feishu.setOnMessage((chatId, messageId, text, chatType, resources, senderOpenId) => {
-      void this.receiveMessage({ chatId, messageId, text, chatType, senderOpenId, resources }).catch((error: unknown) => {
+      const conversationId = conversationIdentity(
+        chatId,
+        chatType,
+        senderOpenId,
+        this.groupSessionMode,
+      );
+      void this.receiveMessage({
+        chatId,
+        conversationId,
+        messageId,
+        text,
+        chatType,
+        senderOpenId,
+        resources,
+      }).catch((error: unknown) => {
         this.logger.error("Unable to handle Feishu message", error);
       });
     });
@@ -129,14 +189,13 @@ export class CodexFeishuBridge {
   }
 
   async stop(): Promise<void> {
-    for (const pending of this.pendingApprovals.values()) {
-      try {
-        this.appServer.respond(pending.request.requestId, { decision: "decline" });
-      } catch (error) {
-        this.logger.warn("Unable to decline pending approval during shutdown", error);
-      }
+    this.stopping = true;
+    this.declineAllPending("shutdown");
+    this.attachmentDispatcher?.revokeAll();
+    for (const queue of this.queues.values()) {
+      for (const message of queue) message.completion?.reject(new Error("codex-feishu 服务正在停止"));
     }
-    this.pendingApprovals.clear();
+    this.queues.clear();
     await this.failAllActiveTurns("codex-feishu 服务正在停止");
     this.feishu.disconnect();
     await this.appServer.stop();
@@ -146,24 +205,64 @@ export class CodexFeishuBridge {
     this.unsubscribeRequest?.();
   }
 
+  async enqueueScheduledPrompt(task: {
+    id: string;
+    chatId: string;
+    conversationId: string;
+    creatorOpenId: string;
+    chatType: "p2p" | "group";
+    prompt: string;
+    threadId?: string;
+  }): Promise<void> {
+    const current = await this.sessions.getOrCreate(task.conversationId);
+    if (task.threadId && current.threadId !== task.threadId) {
+      throw new Error("定时任务创建时的 Codex 会话已不是当前会话，请切回后重试");
+    }
+    await new Promise<void>((resolve, reject) => {
+      void this.receiveMessage({
+        chatId: task.chatId,
+        conversationId: task.conversationId,
+        messageId: "",
+        text: task.prompt,
+        chatType: task.chatType,
+        senderOpenId: task.creatorOpenId,
+        resources: [],
+        scheduled: true,
+        completion: { resolve, reject },
+      }).catch((error: unknown) => reject(error instanceof Error ? error : new Error(String(error))));
+    });
+  }
+
   private async receiveMessage(message: InboundMessage): Promise<void> {
+    if (this.stopping) {
+      message.completion?.reject(new Error("codex-feishu 服务正在停止"));
+      return;
+    }
     const text = message.text.trim();
+    if (text === "/stop") {
+      const key = this.pendingByChat.get(message.conversationId);
+      const pending = key ? this.pendingInteractions.get(key) : undefined;
+      if (pending && pending.ownerOpenId === message.senderOpenId) {
+        await this.resolveInteractive(pending, "cancel");
+      }
+    } else if (await this.tryHandleInteractiveText({ ...message, text })) return;
     if (this.commands.isCommand(text)) {
-      const previous = await this.sessions.get(message.chatId);
+      const previous = await this.sessions.get(message.conversationId);
       try {
         const response = await this.commands.execute({
-          chatId: message.chatId,
+          chatId: message.conversationId,
+          deliveryChatId: message.chatId,
           senderOpenId: message.senderOpenId,
           chatType: message.chatType,
         }, text);
-        const session = await this.sessions.get(message.chatId);
+        const session = await this.sessions.get(message.conversationId);
         if (previous && previous.threadId !== session?.threadId) {
-          const runtime = this.runtimes.get(message.chatId);
+          const runtime = this.runtimes.get(message.conversationId);
           if (!runtime || runtime.threadId !== previous.threadId) {
             this.mapper.unregisterThread(previous.threadId);
           }
         }
-        if (session) this.mapper.registerThread(message.chatId, session.threadId);
+        if (session) this.mapper.registerThread(message.conversationId, session.threadId);
         await this.sendChunked(message.chatId, response, message.messageId);
       } catch (error) {
         const normalized = error instanceof Error ? error.message : String(error);
@@ -173,18 +272,19 @@ export class CodexFeishuBridge {
     }
     if (!text && message.resources.length === 0) return;
 
-    const queue = this.queues.get(message.chatId) ?? [];
+    const queue = this.queues.get(message.conversationId) ?? [];
     if (queue.length >= this.maxQueuedPerChat) {
       await this.feishu.sendMessage(
         message.chatId,
         "当前任务排队数量达到限制。请等待完成或执行 /stop。",
         message.messageId,
       );
+      message.completion?.reject(new Error("当前任务排队数量达到限制"));
       return;
     }
     queue.push({ ...message, text });
-    this.queues.set(message.chatId, queue);
-    if (this.processingChats.has(message.chatId)) {
+    this.queues.set(message.conversationId, queue);
+    if (this.processingChats.has(message.conversationId)) {
       await this.feishu.sendMessage(
         message.chatId,
         `已排队（前面还有 ${Math.max(1, queue.length - 1)} 条）`,
@@ -192,79 +292,117 @@ export class CodexFeishuBridge {
       );
       return;
     }
-    void this.processQueue(message.chatId);
+    void this.processQueue(message.conversationId);
   }
 
-  private async processQueue(chatId: string): Promise<void> {
-    if (this.processingChats.has(chatId)) return;
-    this.processingChats.add(chatId);
+  private async processQueue(conversationId: string): Promise<void> {
+    if (this.processingChats.has(conversationId)) return;
+    this.processingChats.add(conversationId);
     try {
-      const queue = this.queues.get(chatId);
+      const queue = this.queues.get(conversationId);
       while (queue && queue.length > 0) {
         const message = queue.shift();
         if (!message) break;
-        await this.processTurn(message);
+        const success = await this.processTurn(message);
+        if (success) message.completion?.resolve();
+        else message.completion?.reject(new Error("Codex 定时任务执行失败"));
       }
     } finally {
-      this.processingChats.delete(chatId);
-      if (this.queues.get(chatId)?.length === 0) this.queues.delete(chatId);
+      this.processingChats.delete(conversationId);
+      if (this.queues.get(conversationId)?.length === 0) this.queues.delete(conversationId);
     }
   }
 
-  private async processTurn(message: InboundMessage): Promise<void> {
-    await this.feishu.startTyping(message.chatId, message.messageId);
+  private async processTurn(message: InboundMessage): Promise<boolean> {
     let runtime: TurnRuntime | undefined;
+    let downloadedPaths: string[] = [];
     try {
-      const input = await this.buildInput(message);
+      if (!message.scheduled) await this.feishu.startTyping(message.chatId, message.messageId);
+      const built = await this.buildInput(message);
+      const input = built.input;
+      downloadedPaths = built.downloadedPaths;
       if (input.length === 0) throw new Error("消息中没有可发送给 Codex 的内容");
 
-      const session = await this.sessions.getOrCreate(message.chatId);
-      this.mapper.registerThread(message.chatId, session.threadId);
-      runtime = this.createRuntime(message, session.threadId);
-      this.runtimes.set(message.chatId, runtime);
+      const session = await this.sessions.getOrCreate(message.conversationId);
+      this.mapper.registerThread(message.conversationId, session.threadId);
+      runtime = this.createRuntime(message, session.threadId, downloadedPaths);
+      this.runtimes.set(message.conversationId, runtime);
+      this.onManagedTurnStart?.(session.threadId);
 
-      const updated = await this.sessions.beginTurn(message.chatId, input);
+      let additionalContext;
+      if (this.attachmentDispatcher && this.attachmentEndpoint) {
+        const scope = this.attachmentDispatcher.createScope({
+          chatId: message.chatId,
+          replyToMessageId: message.messageId,
+          cwd: session.cwd,
+        });
+        runtime.attachmentToken = scope.token;
+        additionalContext = {
+          "codex-feishu-attachments": {
+            kind: "application" as const,
+            value: attachmentInstructions(
+              this.attachmentCommand,
+              this.attachmentEndpoint,
+              scope.token,
+            ),
+          },
+        };
+      }
+      const updated = await this.sessions.beginTurn(message.conversationId, input, { additionalContext });
       runtime.turnId = updated.activeTurnId;
-      await runtime.done;
+      this.armTurnDeadline(runtime);
+      return await runtime.done;
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
       if (runtime) await this.finishRuntime(runtime, false, normalized.message);
       else {
-        await this.sessions.updateStatus(message.chatId, "error");
-        await this.sendChunked(message.chatId, `Codex 任务启动失败：${normalized.message}`, message.messageId);
-        await this.feishu.stopTyping(message.chatId, false);
+        await this.cleanupDownloadedPaths(downloadedPaths);
+        await this.sessions.updateStatus(message.conversationId, "error");
+        await this.sendChunked(message.chatId, `Codex 任务启动失败：${normalized.message}`, message.messageId || undefined);
+        if (!message.scheduled) await this.feishu.stopTyping(message.chatId, false, message.messageId);
       }
+      return false;
     }
   }
 
-  private async buildInput(message: InboundMessage): Promise<TurnInput[]> {
+  private async buildInput(message: InboundMessage): Promise<{ input: TurnInput[]; downloadedPaths: string[] }> {
     const images: TurnInput[] = [];
     const fileLines: string[] = [];
-    for (const resource of message.resources) {
-      const localPath = await this.feishu.downloadResource(
-        message.messageId,
-        resource.fileKey,
-        resource.type,
-        resource.fileName,
-      );
-      if (!localPath) {
-        fileLines.push(`无法下载用户上传的${resourceLabel(resource.type)}。`);
-      } else if (resource.type === "image") {
-        images.push({ type: "localImage", path: localPath });
-      } else {
-        fileLines.push(`用户上传${resourceLabel(resource.type)}：${localPath}`);
+    const downloadedPaths: string[] = [];
+    try {
+      for (const resource of message.resources) {
+        const localPath = await this.feishu.downloadResource(
+          message.messageId,
+          resource.fileKey,
+          resource.type,
+          resource.fileName,
+        );
+        if (!localPath) {
+          fileLines.push(`无法下载用户上传的${resourceLabel(resource.type)}。`);
+        } else {
+          downloadedPaths.push(localPath);
+          if (resource.type === "image") images.push({ type: "localImage", path: localPath });
+          else fileLines.push(`用户上传${resourceLabel(resource.type)}：${localPath}`);
+        }
       }
+    } catch (error) {
+      await this.cleanupDownloadedPaths(downloadedPaths);
+      throw error;
     }
 
     const text = [message.text, ...fileLines].filter(Boolean).join("\n");
-    return [...(text ? [{ type: "text" as const, text, text_elements: [] }] : []), ...images];
+    return {
+      input: [...(text ? [{ type: "text" as const, text, text_elements: [] }] : []), ...images],
+      downloadedPaths,
+    };
   }
 
-  private createRuntime(message: InboundMessage, threadId: string): TurnRuntime {
-    let resolveDone = (): void => {};
-    const done = new Promise<void>((resolve) => { resolveDone = resolve; });
+  private createRuntime(message: InboundMessage, threadId: string, downloadedPaths: string[]): TurnRuntime {
+    let resolveDone = (_success: boolean): void => {};
+    const done = new Promise<boolean>((resolve) => { resolveDone = resolve; });
     return {
       chatId: message.chatId,
+      conversationId: message.conversationId,
       messageId: message.messageId,
       threadId,
       ownerOpenId: message.senderOpenId,
@@ -276,9 +414,31 @@ export class CodexFeishuBridge {
       flushChain: Promise.resolve(),
       progressChain: Promise.resolve(),
       finishing: false,
+      downloadedPaths,
       done,
       resolveDone,
     };
+  }
+
+  private armTurnDeadline(runtime: TurnRuntime): void {
+    if (this.turnDeadlineMs <= 0) return;
+    runtime.deadlineTimer = setTimeout(() => {
+      void (async () => {
+        await this.feishu.sendMessage(
+          runtime.chatId,
+          "Codex 任务已达到最长运行时间，正在尝试中断。",
+          runtime.messageId || undefined,
+        ).catch((error: unknown) => this.logger.warn("Unable to notify expired Codex turn", error));
+        await this.sessions.interrupt(runtime.conversationId).catch((error: unknown) => {
+          this.logger.warn("Unable to interrupt expired Codex turn", error);
+        });
+        runtime.deadlineGraceTimer = setTimeout(() => {
+          void this.finishRuntime(runtime, false, "任务超过最长运行时间，已终止等待");
+        }, this.turnInterruptGraceMs);
+        runtime.deadlineGraceTimer.unref();
+      })();
+    }, this.turnDeadlineMs);
+    runtime.deadlineTimer.unref();
   }
 
   private onNotification(notification: JsonRpcNotification): void {
@@ -295,73 +455,177 @@ export class CodexFeishuBridge {
   }
 
   private async handleServerRequest(request: JsonRpcRequest): Promise<void> {
-    const approval = mapApprovalRequest(request);
-    if (!approval) {
+    const interactive = parseInteractiveRequest(request);
+    if (!interactive) {
       this.appServer.respondError(request.id, -32601, `Unsupported App Server request ${request.method}`);
       return;
     }
-    const chatId = approval.threadId ? this.mapper.chatIdForThread(approval.threadId) : undefined;
-    if (!chatId) {
-      this.appServer.respondError(request.id, -32001, "No Feishu chat mapped to approval thread");
+    const conversationId = interactive.threadId ? this.mapper.chatIdForThread(interactive.threadId) : undefined;
+    if (!conversationId) {
+      this.appServer.respondError(request.id, -32001, "No Feishu chat mapped to interactive request thread");
       return;
     }
 
-    const key = approvalKey(request.id);
-    const runtime = this.runtimes.get(chatId);
+    const key = interactiveKey(request.id);
+    const runtime = this.runtimes.get(conversationId);
     if (!runtime) {
-      this.appServer.respondError(request.id, -32002, "No active Feishu task owner for approval");
+      this.appServer.respondError(request.id, -32002, "No active Feishu task owner for interactive request");
+      return;
+    }
+    if (this.pendingByChat.has(conversationId)) {
+      this.appServer.respondError(request.id, -32003, "Another interactive request is already pending for this chat");
       return;
     }
     await this.sessions.updateStatus(
-      chatId,
+      conversationId,
       "waiting_approval",
-      approval.turnId ?? runtime?.turnId,
-      approval.threadId,
+      interactive.turnId ?? runtime.turnId,
+      interactive.threadId,
     );
-    const pending: PendingApproval = {
-      request: approval,
-      chatId,
+    const pending: PendingInteractive = {
+      request: interactive,
+      chatId: runtime.chatId,
+      conversationId,
       messageId: null,
       ownerOpenId: runtime.ownerOpenId,
+      answers: {},
+      questionIndex: 0,
     };
-    this.pendingApprovals.set(key, pending);
-    const messageId = await this.feishu.sendCard(chatId, approvalCard(approval));
+    this.pendingInteractions.set(key, pending);
+    this.pendingByChat.set(conversationId, key);
+    if (interactive.autoResolutionMs) {
+      pending.timeout = setTimeout(() => {
+        void this.resolveInteractive(pending, "cancel").catch((error: unknown) => {
+          this.logger.warn("Unable to auto-resolve interactive request", error);
+        });
+      }, interactive.autoResolutionMs);
+      pending.timeout.unref();
+    }
+    const messageId = await this.feishu.sendCard(runtime.chatId, interactiveRequestCard(interactive));
     pending.messageId = messageId;
     if (!messageId) {
-      this.pendingApprovals.delete(key);
-      this.appServer.respond(request.id, { decision: "decline" });
-      await this.sessions.updateStatus(
-        chatId,
-        "running",
-        approval.turnId ?? runtime?.turnId,
-        approval.threadId,
-      );
+      await this.resolveInteractive(pending, "decline", false);
     }
   }
 
   private async handleCardAction(action: FeishuCardAction): Promise<void> {
-    const pending = this.pendingApprovals.get(action.requestId);
-    if (!pending) return;
-    if (action.operatorOpenId !== pending.ownerOpenId) {
-      await this.feishu.sendMessage(pending.chatId, "只有发起当前任务的用户可以处理该审批。");
+    const pending = this.pendingInteractions.get(action.requestId);
+    if (!pending) {
+      await this.externalCardActionHandler?.(action);
       return;
     }
-    this.pendingApprovals.delete(action.requestId);
-    const decision: ApprovalDecision = action.action === "approve" ? "accept" : "decline";
-    this.appServer.respond(pending.request.requestId, { decision });
-    if (pending.messageId) {
+    if (action.operatorOpenId !== pending.ownerOpenId) {
+      await this.feishu.sendMessage(pending.chatId, "只有发起当前任务的用户可以处理该请求。");
+      return;
+    }
+    if (action.action === "reject") {
+      await this.resolveInteractive(pending, "decline");
+      return;
+    }
+    if (action.action === "approve" || action.action === "complete") {
+      await this.resolveInteractive(pending, "accept");
+      return;
+    }
+    const question = pending.request.questions[pending.questionIndex];
+    if (!question || (action.questionId && action.questionId !== question.id)) return;
+    if (action.action === "answer" && typeof action.answer === "string") {
+      pending.answers[question.id] = [action.answer];
+      await this.advanceInteractive(pending);
+      return;
+    }
+    if (action.action === "skip" && !question.required) {
+      await this.advanceInteractive(pending);
+    }
+  }
+
+  private async tryHandleInteractiveText(message: InboundMessage): Promise<boolean> {
+    const key = this.pendingByChat.get(message.conversationId);
+    const pending = key ? this.pendingInteractions.get(key) : undefined;
+    if (!pending || message.senderOpenId !== pending.ownerOpenId) return false;
+    const question = pending.request.questions[pending.questionIndex];
+    if (!question) return false;
+    if (question.options && !question.allowOther) {
+      await this.feishu.sendMessage(message.chatId, "请使用交互卡片中的选项回答当前问题。", message.messageId);
+      return true;
+    }
+    if (!message.text || message.resources.length > 0) {
+      await this.feishu.sendMessage(message.chatId, "当前问题只接受文本答案。", message.messageId);
+      return true;
+    }
+    if (question.valueType === "json") {
+      try {
+        const parsed: unknown = JSON.parse(message.text);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+      } catch {
+        await this.feishu.sendMessage(message.chatId, "请输入有效的 JSON 对象。", message.messageId);
+        return true;
+      }
+    }
+    pending.answers[question.id] = [message.text];
+    await this.advanceInteractive(pending);
+    return true;
+  }
+
+  private async advanceInteractive(pending: PendingInteractive): Promise<void> {
+    pending.questionIndex += 1;
+    if (pending.questionIndex >= pending.request.questions.length) {
+      await this.resolveInteractive(pending, "accept");
+      return;
+    }
+    const nextCard = interactiveRequestCard(pending.request, pending.questionIndex);
+    if (pending.messageId) await this.feishu.updateCard(pending.messageId, nextCard);
+    else pending.messageId = await this.feishu.sendCard(pending.chatId, nextCard);
+  }
+
+  private async resolveInteractive(
+    pending: PendingInteractive,
+    resolution: InteractiveResolution,
+    updateCard = true,
+  ): Promise<void> {
+    const key = interactiveKey(pending.request.requestId);
+    if (this.pendingInteractions.get(key) !== pending) return;
+    this.pendingInteractions.delete(key);
+    if (this.pendingByChat.get(pending.conversationId) === key) {
+      this.pendingByChat.delete(pending.conversationId);
+    }
+    if (pending.timeout) clearTimeout(pending.timeout);
+    this.appServer.respond(
+      pending.request.requestId,
+      buildInteractiveResponse(pending.request, resolution, pending.answers),
+    );
+    if (updateCard && pending.messageId) {
       await this.feishu.updateCard(
         pending.messageId,
-        approvalResolvedCard(pending.request, decision),
+        interactiveResolvedCard(pending.request, resolution, pending.answers),
       );
     }
-    const runtime = this.runtimes.get(pending.chatId);
+    const runtime = this.runtimes.get(pending.conversationId);
     await this.sessions.updateStatus(
-      pending.chatId,
+      pending.conversationId,
       "running",
       pending.request.turnId ?? runtime?.turnId,
       pending.request.threadId,
     );
+  }
+
+  private declineAllPending(reason: "shutdown" | "failure"): void {
+    for (const pending of this.pendingInteractions.values()) {
+      if (pending.timeout) clearTimeout(pending.timeout);
+      try {
+        this.appServer.respond(
+          pending.request.requestId,
+          buildInteractiveResponse(
+            pending.request,
+            reason === "shutdown" ? "decline" : "cancel",
+            pending.answers,
+          ),
+        );
+      } catch (error) {
+        this.logger.warn("Unable to resolve pending interactive request", error);
+      }
+    }
+    this.pendingInteractions.clear();
+    this.pendingByChat.clear();
   }
 
   private async handleAgentEvent(event: AgentEvent): Promise<void> {
@@ -416,7 +680,9 @@ export class CodexFeishuBridge {
     if (runtime.flushTimer || runtime.finishing) return;
     runtime.flushTimer = setTimeout(() => {
       runtime.flushTimer = null;
-      void this.flushStream(runtime, false);
+      void this.flushStream(runtime, false).catch((error: unknown) => {
+        this.logger.warn("Unable to flush streaming Feishu output", error);
+      });
     }, this.streamFlushMs);
     runtime.flushTimer.unref();
   }
@@ -426,7 +692,7 @@ export class CodexFeishuBridge {
       clearTimeout(runtime.flushTimer);
       runtime.flushTimer = null;
     }
-    runtime.flushChain = runtime.flushChain.then(async () => {
+    runtime.flushChain = runtime.flushChain.catch(() => undefined).then(async () => {
       const text = splitText(runtime.text)[0] ?? "";
       const card = final ? finalCard(text) : streamingCard(text);
       if (runtime.streamMessageId) await this.feishu.updateCard(runtime.streamMessageId, card);
@@ -441,7 +707,7 @@ export class CodexFeishuBridge {
   }
 
   private syncProgress(runtime: TurnRuntime, finished = false): Promise<void> {
-    runtime.progressChain = runtime.progressChain.then(async () => {
+    runtime.progressChain = runtime.progressChain.catch(() => undefined).then(async () => {
       const card = progressCard([...runtime.tools.values()], finished);
       if (runtime.progressMessageId) await this.feishu.updateCard(runtime.progressMessageId, card);
       else runtime.progressMessageId = await this.feishu.sendCard(runtime.chatId, card, runtime.messageId);
@@ -450,7 +716,10 @@ export class CodexFeishuBridge {
   }
 
   private async finishRuntime(runtime: TurnRuntime, success: boolean, error?: string): Promise<void> {
-    if (runtime.finishing) return runtime.done;
+    if (runtime.finishing) {
+      await runtime.done;
+      return;
+    }
     runtime.finishing = true;
     if (!success) {
       const message = error ?? "Codex 任务执行失败";
@@ -476,7 +745,7 @@ export class CodexFeishuBridge {
     }
     try {
       await this.sessions.updateStatus(
-        runtime.chatId,
+        runtime.conversationId,
         success ? "idle" : "error",
         undefined,
         runtime.threadId,
@@ -485,19 +754,30 @@ export class CodexFeishuBridge {
       this.logger.error("Unable to update final session status", sessionError);
     }
     try {
-      await this.feishu.stopTyping(runtime.chatId, success);
+      if (runtime.messageId) await this.feishu.stopTyping(runtime.chatId, success, runtime.messageId);
     } catch (reactionError) {
       this.logger.warn("Unable to clear Feishu Typing reaction", reactionError);
     } finally {
-      this.runtimes.delete(runtime.chatId);
+      if (runtime.attachmentToken) this.attachmentDispatcher?.revoke(runtime.attachmentToken);
+      await this.cleanupDownloadedPaths(runtime.downloadedPaths);
+      if (runtime.deadlineTimer) clearTimeout(runtime.deadlineTimer);
+      if (runtime.deadlineGraceTimer) clearTimeout(runtime.deadlineGraceTimer);
+      await this.onManagedTurnFinished?.(runtime.threadId).catch((error: unknown) => {
+        this.logger.warn("Unable to advance local sync cursor after managed turn", error);
+      });
+      this.runtimes.delete(runtime.conversationId);
       try {
-        const current = await this.sessions.get(runtime.chatId);
+        const current = await this.sessions.get(runtime.conversationId);
         if (current?.threadId !== runtime.threadId) this.mapper.unregisterThread(runtime.threadId);
       } catch (sessionError) {
         this.logger.warn("Unable to clean up completed thread mapping", sessionError);
       }
-      runtime.resolveDone();
+      runtime.resolveDone(success);
     }
+  }
+
+  private async cleanupDownloadedPaths(paths: string[]): Promise<void> {
+    await Promise.all(paths.map((path) => unlink(path).catch(() => {})));
   }
 
   private async failAllActiveTurns(message: string): Promise<void> {
@@ -505,7 +785,7 @@ export class CodexFeishuBridge {
   }
 
   private async handleAppServerFailure(message: string): Promise<void> {
-    this.pendingApprovals.clear();
+    this.declineAllPending("failure");
     await this.failAllActiveTurns(message);
   }
 
@@ -526,6 +806,34 @@ function resourceLabel(type: InboundResource["type"]): string {
   }
 }
 
-function approvalKey(id: JsonRpcId): string {
+function interactiveKey(id: JsonRpcId): string {
   return String(id);
+}
+
+function conversationIdentity(
+  chatId: string,
+  chatType: "p2p" | "group",
+  senderOpenId: string,
+  groupMode: "per-user" | "shared",
+): string {
+  if (chatType === "p2p" || groupMode === "shared") return chatId;
+  return `${chatId}:user:${senderOpenId}`;
+}
+
+function defaultAttachmentCommand(): string {
+  const entry = process.argv[1];
+  return entry
+    ? `${JSON.stringify(process.execPath)} ${JSON.stringify(entry)} send`
+    : "codex-feishu send";
+}
+
+function attachmentInstructions(command: string, endpoint: string, token: string): string {
+  const common = `${command} --endpoint ${endpoint} --token ${token}`;
+  return [
+    "You can return files generated during this turn to the originating Feishu chat.",
+    "Only send a file when the user asks for it or when the file is a direct deliverable.",
+    `For an image run: ${common} --image \"/absolute/path/to/image.png\"`,
+    `For another file run: ${common} --file \"/absolute/path/to/file\"`,
+    "The path must be an existing regular file inside the current workspace. This capability expires when the turn ends.",
+  ].join("\n");
 }

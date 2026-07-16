@@ -9,8 +9,8 @@
  */
 
 import * as Lark from "@larksuiteoapi/node-sdk";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { readdir, stat, unlink } from "node:fs/promises";
+import { chmodSync, mkdirSync, mkdtempSync } from "node:fs";
+import { open, readdir, rm, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "../types.js";
@@ -41,8 +41,6 @@ const DEDUP_MAX_ENTRIES = 5000;
 const DEDUP_SWEEP_INTERVAL = 5 * 60 * 1000;
 /** 消息过期判定（30 分钟） */
 const MESSAGE_EXPIRY_MS = 30 * 60 * 1000;
-/** 媒体文件临时目录 */
-const MEDIA_TEMP_DIR = join(tmpdir(), "feishu-media");
 /** 单个入站媒体文件最大 25 MiB，避免意外占满磁盘 */
 const MAX_MEDIA_FILE_BYTES = 25 * 1024 * 1024;
 const MEDIA_FILE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -99,6 +97,7 @@ export class FeishuClient implements FeishuPort {
   private dedupMap: Map<string, number> = new Map();
   private dedupSweepTimer: ReturnType<typeof setInterval> | null = null;
   private mediaSweepTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly mediaTempDir: string;
 
   // Bot 身份（连接后探测）
   private botOpenId: string = "";
@@ -109,7 +108,7 @@ export class FeishuClient implements FeishuPort {
   private onCardActionCallback: CardActionHandler | null = null;
 
   // Reaction 跟踪：chatId → { msgId, reactionId }
-  private typingMessages: Map<string, { msgId: string; reactionId: string }> = new Map();
+  private typingMessages: Map<string, { chatId: string; msgId: string; reactionId: string }> = new Map();
 
   constructor(private config: FeishuConfig) {
     const domain = config.domain === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
@@ -121,10 +120,8 @@ export class FeishuClient implements FeishuPort {
       domain,
     });
 
-    // 确保临时目录存在
-    if (!existsSync(MEDIA_TEMP_DIR)) {
-      mkdirSync(MEDIA_TEMP_DIR, { recursive: true });
-    }
+    this.mediaTempDir = mkdtempSync(join(tmpdir(), "codex-feishu-media-"));
+    if (process.platform !== "win32") chmodSync(this.mediaTempDir, 0o700);
   }
 
   // ─── 公开 API ───────────────────────────────────────
@@ -137,6 +134,8 @@ export class FeishuClient implements FeishuPort {
     }
 
     this.setStatus("connecting");
+    mkdirSync(this.mediaTempDir, { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") chmodSync(this.mediaTempDir, 0o700);
     _log("Connecting to Feishu WebSocket...");
 
     try {
@@ -166,7 +165,11 @@ export class FeishuClient implements FeishuPort {
             ?? data?.operator_open_id;
           if (
             this.onCardActionCallback
-            && (action === "approve" || action === "reject")
+            && (action === "approve"
+              || action === "reject"
+              || action === "answer"
+              || action === "skip"
+              || action === "complete")
             && typeof requestId === "string"
             && typeof operatorOpenId === "string"
             && operatorOpenId.length > 0
@@ -176,6 +179,8 @@ export class FeishuClient implements FeishuPort {
               requestId,
               operatorOpenId,
               messageId: data?.context?.open_message_id ?? data?.open_message_id,
+              ...(typeof value?.questionId === "string" ? { questionId: value.questionId } : {}),
+              ...(typeof value?.answer === "string" ? { answer: value.answer } : {}),
             });
           }
           return {};
@@ -255,9 +260,10 @@ export class FeishuClient implements FeishuPort {
       clearInterval(this.mediaSweepTimer);
       this.mediaSweepTimer = null;
     }
+    void rm(this.mediaTempDir, { recursive: true, force: true });
 
     // 清除所有 typing reactions
-    for (const [chatId, entry] of this.typingMessages) {
+    for (const entry of this.typingMessages.values()) {
       this.removeReactionById(entry.msgId, entry.reactionId).catch(() => {});
     }
     this.typingMessages.clear();
@@ -363,47 +369,22 @@ export class FeishuClient implements FeishuPort {
       const safeName = (fileName && fileName.length > 0)
         ? fileName.replace(/[^a-zA-Z0-9._-]/g, "_")
         : `${fileKey}${ext}`;
-      const localPath = join(MEDIA_TEMP_DIR, `${Date.now()}-${safeName}`);
+      const localPath = join(this.mediaTempDir, `${Date.now()}-${safeName}`);
 
-      // 优先使用 writeFile()（SDK 原生写入磁盘）
-      if (typeof resp.writeFile === "function") {
-        await resp.writeFile(localPath);
-        if (!(await this.validateDownloadedFile(localPath))) return null;
-        _log(`Resource downloaded via writeFile to ${localPath}`);
-        return localPath;
-      }
-
-      // 回退：使用 getReadableStream() 手动收集
+      // 优先流式写入，在下载过程中执行大小限制，避免完整内容进入内存或磁盘。
       if (typeof resp.getReadableStream === "function") {
         const stream = resp.getReadableStream();
-        const chunks: Buffer[] = [];
-        for await (const chunk of stream as AsyncIterable<Buffer>) {
-          chunks.push(Buffer.from(chunk));
-        }
-        const buffer = Buffer.concat(chunks);
-        if (buffer.length > MAX_MEDIA_FILE_BYTES) {
-          _warn(`Resource exceeds ${MAX_MEDIA_FILE_BYTES} bytes, discarded`);
-          return null;
-        }
-        writeFileSync(localPath, buffer);
-        _log(`Resource downloaded via stream to ${localPath} (${buffer.length} bytes)`);
+        const bytes = await writeLimitedStream(localPath, stream as AsyncIterable<Buffer>, MAX_MEDIA_FILE_BYTES);
+        _log(`Resource downloaded via stream to ${localPath} (${bytes} bytes)`);
         return localPath;
       }
 
-      _warn("No writeFile or getReadableStream on response");
+      _warn("Feishu SDK response does not expose a bounded readable stream; resource rejected");
       return null;
     } catch (err) {
       _warn("Download resource failed:", err);
       return null;
     }
-  }
-
-  private async validateDownloadedFile(localPath: string): Promise<boolean> {
-    const info = await stat(localPath);
-    if (info.size <= MAX_MEDIA_FILE_BYTES) return true;
-    await unlink(localPath).catch(() => {});
-    _warn(`Resource exceeds ${MAX_MEDIA_FILE_BYTES} bytes, discarded: ${localPath}`);
-    return false;
   }
 
   /** 上传图片到飞书，返回 image_key */
@@ -493,16 +474,18 @@ export class FeishuClient implements FeishuPort {
   async startTyping(chatId: string, msgId: string): Promise<void> {
     const reactionId = await this.addReaction(msgId, REACTION_TYPING);
     if (reactionId) {
-      this.typingMessages.set(chatId, { msgId, reactionId });
+      this.typingMessages.set(msgId, { chatId, msgId, reactionId });
     }
   }
 
   /** 停止 typing 指示（处理完成时调用） */
-  async stopTyping(chatId: string, success: boolean = true): Promise<void> {
-    const entry = this.typingMessages.get(chatId);
+  async stopTyping(chatId: string, success: boolean = true, messageId?: string): Promise<void> {
+    const key = messageId ?? [...this.typingMessages.entries()]
+      .find(([, candidate]) => candidate.chatId === chatId)?.[0];
+    const entry = key ? this.typingMessages.get(key) : undefined;
     if (!entry) return;
 
-    this.typingMessages.delete(chatId);
+    this.typingMessages.delete(key!);
 
     // 移除 Typing reaction（用真实的 reaction_id）
     await this.removeReactionById(entry.msgId, entry.reactionId).catch(() => {});
@@ -834,9 +817,9 @@ export class FeishuClient implements FeishuPort {
     if (this.mediaSweepTimer) clearInterval(this.mediaSweepTimer);
     const sweep = async (): Promise<void> => {
       const now = Date.now();
-      const files = await readdir(MEDIA_TEMP_DIR).catch(() => []);
+      const files = await readdir(this.mediaTempDir).catch(() => []);
       await Promise.all(files.map(async (fileName) => {
-        const path = join(MEDIA_TEMP_DIR, fileName);
+        const path = join(this.mediaTempDir, fileName);
         const info = await stat(path).catch(() => null);
         if (info?.isFile() && now - info.mtimeMs >= MEDIA_FILE_TTL_MS) {
           await unlink(path).catch(() => {});
@@ -856,6 +839,34 @@ export class FeishuClient implements FeishuPort {
 }
 
 // ─── 工具函数 ─────────────────────────────────────────
+
+export async function writeLimitedStream(
+  path: string,
+  stream: AsyncIterable<Buffer | Uint8Array | string>,
+  maxBytes: number,
+): Promise<number> {
+  const handle = await open(path, "wx", 0o600);
+  let total = 0;
+  try {
+    for await (const chunk of stream) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buffer.length;
+      if (total > maxBytes) throw new Error(`Resource exceeds ${maxBytes} bytes`);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesWritten } = await handle.write(buffer, offset);
+        offset += bytesWritten;
+      }
+    }
+    return total;
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await unlink(path).catch(() => {});
+    throw error;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

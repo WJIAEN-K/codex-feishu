@@ -9,7 +9,9 @@
   "codex": {
     "command": "codex",
     "args": ["app-server", "--stdio"],
-    "requestTimeoutMs": 120000
+    "requestTimeoutMs": 120000,
+    "localDiscoveryEnabled": true,
+    "localStateDatabasePath": "/Users/your-name/.codex/state_5.sqlite"
   },
   "workspace": {
     "defaultPath": "/absolute/path/to/project",
@@ -29,7 +31,32 @@
   "queue": {
     "maxPerChat": 20
   },
+  "attachments": {
+    "enabled": true,
+    "maxFileBytes": 52428800
+  },
+  "sessions": {
+    "groupMode": "per-user",
+    "idleResetMs": 0
+  },
+  "scheduler": {
+    "enabled": true,
+    "pollIntervalMs": 1000,
+    "retryDelayMs": 60000,
+    "maxRetries": 3
+  },
+  "localSync": {
+    "enabled": true,
+    "pollIntervalMs": 750,
+    "approvalTimeoutMs": 300000
+  },
+  "admin": {
+    "enabled": true,
+    "port": 0
+  },
   "runtime": {
-    "logLevel": "info"
+    "logLevel": "info",
+    "turnDeadlineMs": 3600000,
+    "turnInterruptGraceMs": 10000
   }
 }

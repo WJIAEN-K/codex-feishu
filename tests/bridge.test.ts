@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { CodexAppServerClient } from "../src/app-server/client.js";
+import { AttachmentDispatcher } from "../src/attachments/dispatcher.js";
 import type { JsonRpcId, JsonRpcNotification, JsonRpcRequest } from "../src/app-server/jsonrpc.js";
 import { CodexFeishuBridge } from "../src/bridge/codex-feishu-bridge.js";
 import { CommandRouter } from "../src/commands/index.js";
 import type {
   CardActionHandler,
+  FeishuCardAction,
   FeishuPort,
   InboundResource,
   MessageHandler,
@@ -25,6 +27,7 @@ class FakeFeishu implements FeishuPort {
   typingStops: Array<{ chatId: string; success: boolean }> = [];
   cardReturnsNull = false;
   failCardUpdates = false;
+  failMessages = false;
 
   async connect(): Promise<void> {}
   disconnect(): void {}
@@ -33,6 +36,7 @@ class FakeFeishu implements FeishuPort {
   setOnStatusChange(): void {}
   setOnCardAction(handler: CardActionHandler): void { this.cardActionHandler = handler; }
   async sendMessage(chatId: string, text: string, replyTo?: string): Promise<void> {
+    if (this.failMessages) throw new Error("message delivery failed");
     this.messages.push({ chatId, text, replyTo });
   }
   async sendCard(_chatId: string, card: Record<string, unknown>, replyTo?: string): Promise<string | null> {
@@ -52,6 +56,10 @@ class FakeFeishu implements FeishuPort {
   ): Promise<string> {
     return `/tmp/feishu-media/${fileName ?? fileKey}`;
   }
+  async uploadImage(): Promise<string> { return "image-key"; }
+  async uploadFile(): Promise<string> { return "file-key"; }
+  async sendImage(): Promise<void> {}
+  async sendFile(): Promise<void> {}
   async startTyping(chatId: string): Promise<void> { this.typingStarts.push(chatId); }
   async stopTyping(chatId: string, success = true): Promise<void> {
     this.typingStops.push({ chatId, success });
@@ -65,12 +73,21 @@ class FakeFeishu implements FeishuPort {
   ): void {
     this.handler?.(chatId, messageId, text, "p2p", resources, senderOpenId);
   }
+  receiveGroup(
+    chatId: string,
+    messageId: string,
+    text: string,
+    senderOpenId: string,
+  ): void {
+    this.handler?.(chatId, messageId, text, "group", [], senderOpenId);
+  }
   async click(
     requestId: string,
-    action: "approve" | "reject",
+    action: FeishuCardAction["action"],
     operatorOpenId = "ou-test-user",
+    details: Pick<FeishuCardAction, "questionId" | "answer"> = {},
   ): Promise<void> {
-    await this.cardActionHandler?.({ requestId, action, operatorOpenId });
+    await this.cardActionHandler?.({ requestId, action, operatorOpenId, ...details });
   }
 }
 
@@ -143,7 +160,13 @@ function defaultScenario(threadId: string, turnId: string): JsonRpcNotification[
   ];
 }
 
-async function setup(options: { maxQueuedPerChat?: number } = {}) {
+async function setup(options: {
+  maxQueuedPerChat?: number;
+  attachments?: boolean;
+  groupSessionMode?: "per-user" | "shared";
+  turnDeadlineMs?: number;
+  turnInterruptGraceMs?: number;
+} = {}) {
   const feishu = new FakeFeishu();
   const appServer = new FakeAppServer();
   const sessions = new SessionManager(
@@ -156,16 +179,28 @@ async function setup(options: { maxQueuedPerChat?: number } = {}) {
     appServer as unknown as CodexAppServerClient,
     {} as WorkspaceRegistry,
   );
+  const attachmentDispatcher = options.attachments
+    ? new AttachmentDispatcher(feishu, { maxFileBytes: 1024 })
+    : undefined;
   const bridge = new CodexFeishuBridge(
     feishu,
     appServer as unknown as CodexAppServerClient,
     sessions,
     commands,
     new Logger("error"),
-    { streamFlushMs: 1, maxQueuedPerChat: options.maxQueuedPerChat },
+    {
+      streamFlushMs: 1,
+      maxQueuedPerChat: options.maxQueuedPerChat,
+      attachmentDispatcher,
+      attachmentEndpoint: attachmentDispatcher ? "http://127.0.0.1:12345" : undefined,
+      attachmentCommand: "codex-feishu send",
+      groupSessionMode: options.groupSessionMode,
+      turnDeadlineMs: options.turnDeadlineMs,
+      turnInterruptGraceMs: options.turnInterruptGraceMs,
+    },
   );
   await bridge.start();
-  return { feishu, appServer, sessions, bridge };
+  return { feishu, appServer, sessions, bridge, attachmentDispatcher };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
@@ -188,6 +223,35 @@ function allRenderedCardText(feishu: FakeFeishu): string {
 }
 
 describe("CodexFeishuBridge", () => {
+  it("interrupts a turn at its wall-clock deadline and recovers the queue", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup({
+      turnDeadlineMs: 10,
+      turnInterruptGraceMs: 10,
+    });
+    appServer.turnScenario = () => [];
+    feishu.receive("chat-1", "message-1", "无限等待任务");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/interrupt"));
+    await waitFor(() => feishu.typingStops.length === 1);
+
+    expect(feishu.messages.some(({ text }) => text.includes("最长运行时间"))).toBe(true);
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "error" });
+    appServer.turnScenario = defaultScenario;
+    feishu.receive("chat-1", "message-2", "恢复执行");
+    await waitFor(() => feishu.typingStops.length === 2);
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "idle" });
+    await bridge.stop();
+  });
+
+  it("still interrupts an expired turn when the warning message cannot be delivered", async () => {
+    const { feishu, appServer, bridge } = await setup({ turnDeadlineMs: 10, turnInterruptGraceMs: 10 });
+    appServer.turnScenario = () => [];
+    feishu.failMessages = true;
+    feishu.receive("chat-1", "message-1", "无限等待任务");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/interrupt"));
+    feishu.failMessages = false;
+    await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
   it("streams text, updates tool progress, and cleans up a completed turn", async () => {
     const { feishu, appServer, sessions, bridge } = await setup();
     appServer.turnScenario = (threadId, turnId) => [
@@ -245,6 +309,53 @@ describe("CodexFeishuBridge", () => {
     await bridge.stop();
   });
 
+  it("reports scheduled turns as failed and refuses to run them in a different saved thread", async () => {
+    const { appServer, sessions, bridge } = await setup();
+    const original = await sessions.getOrCreate("chat-1");
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+      { method: "turn/error", params: { threadId, turnId, error: { message: "scheduled failed" } } },
+    ];
+    const task = {
+      id: "task-1",
+      chatId: "chat-1",
+      conversationId: "chat-1",
+      creatorOpenId: "ou-owner",
+      chatType: "p2p" as const,
+      prompt: "scheduled prompt",
+      threadId: original.threadId,
+    };
+    await expect(bridge.enqueueScheduledPrompt(task)).rejects.toThrow("执行失败");
+
+    await sessions.create("chat-1");
+    await expect(bridge.enqueueScheduledPrompt(task)).rejects.toThrow("已不是当前会话");
+    await bridge.stop();
+  });
+
+  it("isolates group conversations by sender by default", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup();
+    feishu.receiveGroup("group-1", "message-1", "用户一", "ou-user-1");
+    feishu.receiveGroup("group-1", "message-2", "用户二", "ou-user-2");
+    await waitFor(() => feishu.typingStops.length === 2);
+
+    expect(appServer.calls.filter(({ method }) => method === "thread/start")).toHaveLength(2);
+    await expect(sessions.get("group-1:user:ou-user-1")).resolves.toMatchObject({ threadId: "thread-1" });
+    await expect(sessions.get("group-1:user:ou-user-2")).resolves.toMatchObject({ threadId: "thread-2" });
+    expect(feishu.cards.every(({ replyTo }) => replyTo === "message-1" || replyTo === "message-2")).toBe(true);
+    await bridge.stop();
+  });
+
+  it("can explicitly share one session across group users", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup({ groupSessionMode: "shared" });
+    feishu.receiveGroup("group-1", "message-1", "用户一", "ou-user-1");
+    feishu.receiveGroup("group-1", "message-2", "用户二", "ou-user-2");
+    await waitFor(() => feishu.typingStops.length === 2);
+
+    expect(appServer.calls.filter(({ method }) => method === "thread/start")).toHaveLength(1);
+    await expect(sessions.get("group-1")).resolves.toMatchObject({ threadId: "thread-1" });
+    await bridge.stop();
+  });
+
   it("rejects messages beyond the per-chat queue limit", async () => {
     const { feishu, appServer, bridge } = await setup({ maxQueuedPerChat: 1 });
     appServer.turnScenario = (threadId, turnId) => [
@@ -285,6 +396,27 @@ describe("CodexFeishuBridge", () => {
       text: "分析附件\n用户上传文件：/tmp/feishu-media/report.xlsx",
       text_elements: [],
     });
+    await bridge.stop();
+  });
+
+  it("injects a turn-scoped attachment capability and revokes it on completion", async () => {
+    const { feishu, appServer, bridge, attachmentDispatcher } = await setup({ attachments: true });
+    feishu.receive("chat-1", "message-1", "生成报告");
+    await waitFor(() => feishu.typingStops.length === 1);
+
+    const call = appServer.calls.find(({ method }) => method === "turn/start");
+    const context = (call?.params as {
+      additionalContext?: Record<string, { value: string }>;
+    }).additionalContext?.["codex-feishu-attachments"]?.value ?? "";
+    expect(context).toContain("codex-feishu send");
+    expect(context).toContain("http://127.0.0.1:12345");
+    const token = context.match(/--token ([A-Za-z0-9_-]+)/)?.[1];
+    expect(token).toBeTruthy();
+    await expect(attachmentDispatcher!.send({
+      token: token!,
+      path: "/workspace/report.pdf",
+      kind: "file",
+    })).rejects.toThrow("无效或已过期");
     await bridge.stop();
   });
 
@@ -430,6 +562,155 @@ describe("CodexFeishuBridge", () => {
 
     await feishu.click("901", "approve", "ou-owner");
     expect(appServer.responses).toContainEqual({ id: 901, result: { decision: "accept" } });
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
+
+  it("lets the task owner use /stop while an approval is pending", async () => {
+    const { feishu, appServer, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "需要审批", [], "ou-owner");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 905,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-1", command: "dangerous" },
+    });
+    await waitFor(() => feishu.cards.length === 1);
+
+    feishu.receive("chat-1", "message-stop", "/stop", [], "ou-owner");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/interrupt"));
+    expect(appServer.responses.some(({ id }) => id === 905)).toBe(true);
+    expect(feishu.messages.some(({ text }) => text.includes("已请求中断"))).toBe(true);
+
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "cancelled" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
+
+  it("collects request_user_input choices and responds with typed answers", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "部署项目", [], "ou-owner");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 902,
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "input-1",
+        autoResolutionMs: null,
+        questions: [{
+          id: "environment",
+          header: "环境",
+          question: "部署到哪个环境？",
+          isOther: false,
+          isSecret: false,
+          options: [
+            { label: "测试环境", description: "内部验证" },
+            { label: "生产环境", description: "正式发布" },
+          ],
+        }],
+      },
+    });
+    await waitFor(() => allRenderedCardText(feishu).includes("部署到哪个环境"));
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "waiting_approval" });
+
+    await feishu.click("902", "answer", "ou-owner", {
+      questionId: "environment",
+      answer: "测试环境",
+    });
+    expect(appServer.responses).toContainEqual({
+      id: 902,
+      result: { answers: { environment: { answers: ["测试环境"] } } },
+    });
+    expect(allRenderedCardText(feishu)).toContain("已提交");
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "running" });
+
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
+
+  it("collects free-text interactive answers from the task owner", async () => {
+    const { feishu, appServer, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "需要说明", [], "ou-owner");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 903,
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "input-2",
+        autoResolutionMs: null,
+        questions: [{
+          id: "note",
+          header: "说明",
+          question: "请输入发布说明",
+          isOther: true,
+          isSecret: false,
+          options: null,
+        }],
+      },
+    });
+    await waitFor(() => allRenderedCardText(feishu).includes("请输入发布说明"));
+
+    feishu.receive("chat-1", "message-answer", "修复登录问题", [], "ou-owner");
+    await waitFor(() => appServer.responses.some(({ id }) => id === 903));
+    expect(appServer.responses).toContainEqual({
+      id: 903,
+      result: { answers: { note: { answers: ["修复登录问题"] } } },
+    });
+
+    appServer.emit({ method: "turn/completed", params: {
+      threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
+    } });
+    await waitFor(() => feishu.typingStops.length === 1);
+    await bridge.stop();
+  });
+
+  it("returns the requested permission profile only to the active turn", async () => {
+    const { feishu, appServer, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "访问网络");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 904,
+      method: "item/permissions/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "permission-1",
+        cwd: "/workspace",
+        reason: "下载依赖",
+        permissions: { network: { enabled: true }, fileSystem: null },
+      },
+    });
+    await waitFor(() => allRenderedCardText(feishu).includes("扩展权限"));
+    await feishu.click("904", "approve");
+    expect(appServer.responses).toContainEqual({
+      id: 904,
+      result: { permissions: { network: { enabled: true } }, scope: "turn" },
+    });
+
     appServer.emit({ method: "turn/completed", params: {
       threadId: "thread-1", turn: { id: "turn-1", status: "completed" },
     } });

@@ -32,6 +32,8 @@ describe("ConfigFile", () => {
     expect(config.codex.workingDirectory).toBe(project);
     expect(config.codex.allowedRoots).toEqual([project]);
     expect(config.maxQueuedPerChat).toBe(20);
+    expect(config.codex.localDiscoveryEnabled).toBe(true);
+    expect(config.codex.localStateDatabasePath).toContain(".codex/state_5.sqlite");
     expect(resolveConfigPath(["--config", "custom.json"], directory)).toBe(join(directory, "custom.json"));
   });
 

@@ -16,10 +16,12 @@ export type MessageHandler = (
 ) => void;
 
 export interface FeishuCardAction {
-  action: "approve" | "reject";
+  action: "approve" | "reject" | "answer" | "skip" | "complete";
   requestId: string;
   operatorOpenId: string;
   messageId?: string;
+  questionId?: string;
+  answer?: string;
 }
 
 export type CardActionHandler = (action: FeishuCardAction) => Promise<void> | void;
@@ -40,6 +42,10 @@ export interface FeishuPort {
     resourceType: string,
     fileName?: string,
   ): Promise<string | null>;
+  uploadImage(filePath: string): Promise<string | null>;
+  uploadFile(filePath: string, fileName: string, fileType?: string): Promise<string | null>;
+  sendImage(chatId: string, imageKey: string, replyToMessageId?: string): Promise<void>;
+  sendFile(chatId: string, fileKey: string, replyToMessageId?: string): Promise<void>;
   startTyping(chatId: string, messageId: string): Promise<void>;
-  stopTyping(chatId: string, success?: boolean): Promise<void>;
+  stopTyping(chatId: string, success?: boolean, messageId?: string): Promise<void>;
 }

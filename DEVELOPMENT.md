@@ -27,6 +27,9 @@ FeishuClient ──► CodexFeishuBridge ──► SessionManager
 - `src/session/` 负责 `chatId → threadId → cwd`、Turn 状态和 SQLite 持久化。
 - `src/workspace/` 负责 JSON 项目注册、允许目录校验和管理员授权。
 - `src/commands/` 负责斜杠命令，不直接操作飞书 SDK。
+- `src/attachments/` 负责 Turn 作用域能力令牌、本机回环发送端点和路径边界校验。
+- `src/scheduler/` 负责 SQLite 定时任务、Cron 计算、原子 claim、重试和重启恢复。
+- `src/admin/` 负责仅回环管理页面、状态聚合、脱敏和写接口鉴权。
 - `src/bridge/codex-feishu-bridge.ts` 是唯一业务编排层。
 
 飞书客户端和 App Server 客户端不会直接互相调用；所有交互都经由 Bridge。
@@ -79,8 +82,11 @@ JSON 文件使用临时文件加原子 rename 写入，并设置为 `0600`。App
 
 - `item/commandExecution/requestApproval`
 - `item/fileChange/requestApproval`
+- `item/permissions/requestApproval`
+- `item/tool/requestUserInput`
+- `mcpServer/elicitation/request`
 
-请求通过 JSON-RPC `id` 与飞书按钮绑定，同时记录发起当前任务的 Open ID。卡片回调中的操作者 Open ID 必须与任务发起人一致，响应才会发送给 App Server；群聊中的其他成员点击会被拒绝。响应为 `{ "decision": "accept" }` 或 `{ "decision": "decline" }`。Thread 默认使用：
+请求通过 JSON-RPC `id` 与飞书按钮绑定，同时记录发起当前任务的 Open ID。卡片回调中的操作者 Open ID 必须与任务发起人一致，响应才会发送给 App Server；群聊中的其他成员点击会被拒绝。不同请求会返回各自 schema 要求的 decision、answers、permissions 或 elicitation action。权限批准只授予请求中明确列出的能力；关机或 App Server 故障会统一拒绝或取消 pending 请求。Thread 默认使用：
 
 ```text
 approvalPolicy = on-request
@@ -94,6 +100,14 @@ sandbox = workspace-write
 npm run generate:app-server-types
 ```
 
+## 会话、定时任务与截止时间
+
+新版 `sessions`/`active_sessions` 表允许一个 Conversation 保存多个命名 Thread；旧 `chat_sessions` 会幂等迁移且不删除。群聊默认 Conversation ID 为 `chatId:user:openId`。模型、推理强度和运行模式保存在每个 Session 的 `preferences_json`，在 resume 和下一次 `turn/start` 时重新应用。
+
+`scheduled_tasks` 使用 SQLite 持久化。调度循环先原子把到期任务从 `active` claim 为 `running`，重启会把遗留 `running` 恢复为到期任务。一次性任务成功后删除，Cron 重新计算下一次，失败按配置重试并最终标记 `failed`。
+
+Turn 截止时间触发 `turn/interrupt`，宽限期结束仍无完成通知时 Bridge 将 Session 置为 error、释放队列和附件令牌；后续消息仍可继续使用原 Thread。
+
 ## 测试策略
 
 - `jsonrpc.test.ts`：解析、错误响应和无效消息。
@@ -103,6 +117,11 @@ npm run generate:app-server-types
 - `session-manager.test.ts`：Thread 复用、替换、并发保护和中断。
 - `event-mapper.test.ts`：文本、工具、完成和错误事件映射。
 - `bridge.test.ts`：完整消息链、排队、媒体、卡片、分块、审批和清理。
+- `interactive-requests.test.ts`：审批、用户输入、权限与 MCP elicitation 映射。
+- `attachments.test.ts`：能力令牌、回环端点、真实路径与大小边界。
+- `runtime-controls.test.ts`：模型、推理强度、plan/full-auto 与管理员限制。
+- `scheduler.test.ts`：Timer、Cron、重试、原子 claim、授权和重启恢复。
+- `admin-server.test.ts` / `doctor.test.ts`：回环绑定、脱敏、鉴权与诊断。
 - `config-file.test.ts`：JSON schema、路径解析、原子保存和热更新。
 - `feishu-setup.test.ts`：已有 JSON、非交互失败和扫码安全保存。
 - `sqlite-store.test.ts`：数据库重开和 Thread 恢复。
