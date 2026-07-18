@@ -72,6 +72,15 @@ export interface JsonAppConfig {
     authToken?: string;
   };
   runtime: {
+    mode: "auto" | "configured" | "desktop" | "managed";
+    executablePath: string | null;
+    allowDesktopRuntime: boolean;
+    autoDownload: boolean;
+    updateChannel: "stable" | "preview";
+    autoUpdate: boolean;
+    updateCheckIntervalHours: number;
+    managedRuntimeDirectory: string | null;
+    preferManagedRuntimeOnWindows: boolean;
     logLevel: LogLevel;
     turnDeadlineMs: number;
     turnInterruptGraceMs: number;
@@ -237,7 +246,20 @@ export function createDefaultJsonConfig(cwd = process.cwd()): JsonAppConfig {
     scheduler: { enabled: true, pollIntervalMs: 1_000, retryDelayMs: 60_000, maxRetries: 3 },
     localSync: { enabled: true, pollIntervalMs: 750, approvalTimeoutMs: 300_000 },
     admin: { enabled: true, port: 0 },
-    runtime: { logLevel: "info", turnDeadlineMs: 3_600_000, turnInterruptGraceMs: 10_000 },
+    runtime: {
+      mode: "auto",
+      executablePath: null,
+      allowDesktopRuntime: true,
+      autoDownload: true,
+      updateChannel: "stable",
+      autoUpdate: true,
+      updateCheckIntervalHours: 24,
+      managedRuntimeDirectory: null,
+      preferManagedRuntimeOnWindows: true,
+      logLevel: "info",
+      turnDeadlineMs: 3_600_000,
+      turnInterruptGraceMs: 10_000,
+    },
   };
 }
 
@@ -376,6 +398,32 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
   if (draft.admin.authToken !== undefined && !nonEmpty(draft.admin.authToken)) {
     throw new Error("admin.authToken 设置后不能为空");
   }
+  if (!(["auto", "configured", "desktop", "managed"] as const).includes(draft.runtime.mode)) {
+    throw new Error("runtime.mode 必须是 auto、configured、desktop 或 managed");
+  }
+  if (draft.runtime.executablePath !== null && !nonEmpty(draft.runtime.executablePath)) {
+    throw new Error("runtime.executablePath 必须是绝对路径或 null");
+  }
+  const runtimeExecutablePath = draft.runtime.executablePath === null
+    ? null
+    : absolutePath(draft.runtime.executablePath, "runtime.executablePath");
+  for (const key of ["allowDesktopRuntime", "autoDownload", "autoUpdate", "preferManagedRuntimeOnWindows"] as const) {
+    if (typeof draft.runtime[key] !== "boolean") throw new Error(`runtime.${key} 必须是布尔值`);
+  }
+  if (!(["stable", "preview"] as const).includes(draft.runtime.updateChannel)) {
+    throw new Error("runtime.updateChannel 必须是 stable 或 preview");
+  }
+  if (!Number.isSafeInteger(draft.runtime.updateCheckIntervalHours)
+    || draft.runtime.updateCheckIntervalHours <= 0) {
+    throw new Error("runtime.updateCheckIntervalHours 必须是正整数");
+  }
+  if (draft.runtime.managedRuntimeDirectory !== null
+    && !nonEmpty(draft.runtime.managedRuntimeDirectory)) {
+    throw new Error("runtime.managedRuntimeDirectory 必须是绝对路径或 null");
+  }
+  const managedRuntimeDirectory = draft.runtime.managedRuntimeDirectory === null
+    ? null
+    : absolutePath(draft.runtime.managedRuntimeDirectory, "runtime.managedRuntimeDirectory");
   if (!Number.isSafeInteger(draft.runtime.turnDeadlineMs) || draft.runtime.turnDeadlineMs < 0) {
     throw new Error("runtime.turnDeadlineMs 必须是非负整数");
   }
@@ -431,6 +479,15 @@ function normalizeJsonConfig(raw: unknown, baseDirectory: string, requireCredent
       ...(draft.admin.authToken ? { authToken: draft.admin.authToken.trim() } : {}),
     },
     runtime: {
+      mode: draft.runtime.mode,
+      executablePath: runtimeExecutablePath,
+      allowDesktopRuntime: draft.runtime.allowDesktopRuntime,
+      autoDownload: draft.runtime.autoDownload,
+      updateChannel: draft.runtime.updateChannel,
+      autoUpdate: draft.runtime.autoUpdate,
+      updateCheckIntervalHours: draft.runtime.updateCheckIntervalHours,
+      managedRuntimeDirectory,
+      preferManagedRuntimeOnWindows: draft.runtime.preferManagedRuntimeOnWindows,
       logLevel: draft.runtime.logLevel,
       turnDeadlineMs: draft.runtime.turnDeadlineMs,
       turnInterruptGraceMs: draft.runtime.turnInterruptGraceMs,

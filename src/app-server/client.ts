@@ -67,6 +67,14 @@ export class CodexAppServerClient {
     };
   }
 
+  configureProcess(command: string, args: string[] = ["app-server", "--stdio"]): void {
+    if (this.status === "ready" || this.status === "starting") {
+      throw new Error("Cannot change Codex Runtime while App Server is running");
+    }
+    this.options.command = command;
+    this.options.args = [...args];
+  }
+
   async start(): Promise<void> {
     if (this.status === "ready") return;
     if (this.status === "starting") throw new Error("Codex App Server is already starting");

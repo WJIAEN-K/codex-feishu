@@ -34,6 +34,13 @@ describe("ConfigFile", () => {
     expect(config.maxQueuedPerChat).toBe(20);
     expect(config.codex.localDiscoveryEnabled).toBe(true);
     expect(config.codex.localStateDatabasePath).toContain(".codex/state_5.sqlite");
+    expect(config.runtime).toMatchObject({
+      mode: "auto",
+      executablePath: null,
+      allowDesktopRuntime: true,
+      autoDownload: true,
+      updateChannel: "stable",
+    });
     expect(resolveConfigPath(["--config", "custom.json"], directory)).toBe(join(directory, "custom.json"));
   });
 
@@ -41,6 +48,13 @@ describe("ConfigFile", () => {
     const { file, json } = await fixture();
     json.queue.maxPerChat = 0;
     await expect(file.save(json)).rejects.toThrow("queue.maxPerChat");
+  });
+
+  it("validates Runtime manager modes and absolute override paths", async () => {
+    const { file, json } = await fixture();
+    json.runtime.mode = "configured";
+    json.runtime.executablePath = "relative/codex";
+    await expect(file.save(json)).rejects.toThrow("runtime.executablePath");
   });
 
   it("rejects unsupported configuration versions instead of coercing them", async () => {

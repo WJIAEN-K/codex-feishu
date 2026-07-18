@@ -16,6 +16,7 @@ Codex 官方 App Server 的飞书/Lark 客户端。服务通过飞书 Bot WebSoc
 - Typing Reaction 在任务开始时添加，在完成或失败时可靠清理。
 - 同一聊天的消息顺序排队，不同聊天可并行执行。
 - App Server 异常退出后按 1s、2s、5s、10s、30s 指数退避自动重启，并恢复持久化 Thread。
+- 首次安装不要求全局 Codex CLI：按显式配置、PATH、Codex/ChatGPT Desktop、托管 Runtime 的顺序自动发现；macOS 和 Windows 均不可用时会从 OpenAI 官方 GitHub Release 校验下载，Linux 需配置已有 Runtime。
 - JSON-RPC stdin 使用串行写入队列处理背压；单聊天等待队列默认最多 20 条。
 - 审批按钮仅允许当前任务发起人操作，群聊中的其他成员不能代为批准。
 - 可只读跟随 Codex Desktop/CLI 的本地 rollout，把用户输入和最终回答实时推送到飞书；通过官方 `PermissionRequest` hook 也可在飞书批准本地会话操作。
@@ -28,6 +29,8 @@ Codex 官方 App Server 的飞书/Lark 客户端。服务通过飞书 Bot WebSoc
 flowchart LR
   Feishu["飞书 / Lark WebSocket"] --> Client["FeishuClient"]
   Client --> Bridge["CodexFeishuBridge"]
+  Bridge --> Cards["交互卡片与状态更新"]
+  Cards --> Client
   Bridge --> Commands["CommandRouter"]
   Bridge --> Sessions["SessionManager"]
   Bridge --> Mapper["AppServerEventMapper"]
@@ -36,23 +39,30 @@ flowchart LR
   Scheduler --> TaskDB[("SQLite scheduled_tasks")]
   Scheduler --> Bridge
   Bridge <--> Supervisor["CodexAppServerSupervisor"]
+  Supervisor --> Runtime["RuntimeManager"]
+  Runtime --> Downloader["Verified Release Downloader"]
+  Updater["启动与自动更新协调器"] --> Runtime
+  Updater --> Supervisor
   Supervisor <--> AppServer["codex app-server --stdio"]
   AppServer --> Attachment["Turn-scoped Attachment Server"]
   Attachment --> Client
   LocalDB[("Codex state_5.sqlite + rollout JSONL")] --> LocalSync["LocalCodexSyncService"]
   LocalSync --> Client
   LocalHook["Codex PermissionRequest hook"] <--> ApprovalBroker["127.0.0.1 Approval Broker"]
+  Bridge --> ApprovalBroker
   ApprovalBroker --> Client
   Admin["127.0.0.1 Admin Server"] --> Sessions
   Admin --> Scheduler
 ```
 
-新版架构把协议、会话、调度、附件和运维拆成相互独立的服务，`CodexFeishuBridge` 只负责业务编排：
+新版架构把消息数据面、本地会话控制面和 Runtime 生命周期拆成相互独立的服务，`CodexFeishuBridge` 只负责业务编排：
 
 | 模块 | 责任 |
 | --- | --- |
 | `src/feishu/` | WebSocket、消息/卡片、Reaction、媒体下载与上传 |
 | `src/app-server/` | Codex 子进程、JSON-RPC、Thread/Turn、事件映射和交互请求响应 |
+| `src/runtime/` | Runtime 发现、验证、官方 Release 下载、SHA-256、安全解压、版本切换与回滚 |
+| `src/auth/` | 复用默认 Codex Home 认证，以及设备码/浏览器登录 Bootstrap |
 | `src/bridge/` | 消息队列、Turn 生命周期、流式输出、审批归属和异常清理 |
 | `src/session/` | 多会话、活动会话、运行偏好、历史、用量与 SQLite 迁移 |
 | `src/codex-local/` | 只读 Codex `state_5.sqlite`、增量跟随 rollout、批准 hook 与回环 broker |
@@ -70,6 +80,16 @@ flowchart LR
 5. App Server 发起审批、用户输入、权限或 MCP 请求时，Bridge 只允许当前 Turn 的发起人处理。
 6. Turn 完成、失败、超时或服务停止时，统一清理 Typing、pending 请求、附件令牌和活动状态，再继续队列中的下一条消息。
 
+### 飞书交互卡片的确认与状态回写
+
+飞书卡片按钮的回调会先立即返回“正在处理”的确认，再异步把卡片原地更新为“已批准”“已拒绝”或最终答案。这样满足飞书回调时限，也避免在确认响应之前 PATCH 卡片而被平台还原成原始状态。卡片更新失败时，机器人会发送一条文本结果作为兜底；审批结论本身不受卡片更新成败影响。
+
+### Runtime 生命周期与故障恢复
+
+启动时 `RuntimeManager` 依次尝试显式配置、PATH、Desktop 内置 Runtime 与用户级 Managed Runtime；macOS/Windows 在均不可用时才能从官方 Release 下载。下载器校验 GitHub 发布的 SHA-256、在临时目录安全解压并完成 App Server 验证后，原子保留整个 release 目录（包括未来可能需要的动态库和旁路资源），再激活新版本。
+
+自动更新只针对 Managed/下载的 Runtime。`CodexAppServerSupervisor` 会把正常重启、自动恢复、更新切换和失败回滚串行化；计划性切换期间暂停自动恢复，避免一个失败更新同时触发重启循环和回滚。达到恢复阈值后，Supervisor 会重新选择健康 Runtime 并恢复已持久化的 Thread。Linux 当前支持显式路径、PATH 和已有 Managed Runtime，但不会尝试下载尚未发布的 Linux Runtime 资产。
+
 ## 会话与用户隔离
 
 - 私聊使用 `chatId` 作为 Conversation ID。
@@ -79,7 +99,7 @@ flowchart LR
 - 会话级 `model`、`reasoningEffort` 和 `mode` 保存在 `preferences_json`，切换或重启后仍会恢复。
 - 旧版 `chat_sessions` 数据会幂等迁移到新版 `sessions` 表，旧表和旧数据不会删除。
 
-### Codex 本地项目发现
+### 本地既有 Codex 会话的远程控制
 
 项目发现默认以只读方式打开 `~/.codex/state_5.sqlite`，并执行 `PRAGMA query_only = ON`。读取器会先探测 `threads` 表的实际列，再查询未归档 Thread 的工作目录、标题、预览和更新时间，因此可以兼容缺少部分新字段的旧数据库。
 
@@ -94,7 +114,7 @@ flowchart LR
         ↓ App Server thread/read + thread/resume
 ```
 
-本地数据库只用于“发现”。切换会话时仍由 Codex App Server 验证 Thread 状态并执行 `thread/resume`；代码不会修改、迁移或删除 Codex 自己的数据库和 JSONL 会话文件。如果数据库不存在、被占用或 schema 不兼容，`/session list` 会自动回退到 App Server 的 `thread/list`。
+本地数据库和 rollout 文件只用于“发现”和只读同步。切换会话时仍由 Codex App Server 验证 Thread 状态并执行 `thread/resume`；因此飞书是在远程控制同一份 Codex 会话状态，而不是自动化或接管 ChatGPT/Codex Desktop UI。代码不会修改、迁移或删除 Codex 自己的数据库和 JSONL 会话文件。如果数据库不存在、被占用或 schema 不兼容，`/session list` 会自动回退到 App Server 的 `thread/list`。
 
 ### 本地 Codex 会话实时同步与飞书批准
 
@@ -155,10 +175,9 @@ Bridge 会按照 Codex App Server 的不同 schema 返回对应结果，而不�
 ## 环境要求
 
 - Node.js 20 或更高版本
-- 已安装并登录的 Codex CLI
 - 可创建自建应用的飞书或 Lark 账号；也可以使用已有机器人凭证
 
-支持 macOS、Linux 和 Windows。Windows 上建议使用 PowerShell，并确保 `codex --version` 可以正常运行；程序会自动解析 npm 安装产生的 `codex.cmd`，停止时会清理其完整子进程树。
+macOS 和 Windows 支持零 CLI 安装：优先复用 Codex/ChatGPT Desktop 内置 Runtime 和默认 `~/.codex` 认证；桌面 Runtime 不可用时自动安装用户级 Managed Runtime。Linux 继续支持显式路径或 PATH 中已有的 Codex。程序不复制 `auth.json`、不修改 Desktop App/WindowsApps，也不控制桌面 UI。
 
 ## 安装与配置
 
@@ -185,7 +204,7 @@ codex-feishu --version
 输出示例：
 
 ```text
-codex-feishu 0.1.0
+codex-feishu 0.1.1
 ```
 
 也可以通过 npm 查看全局安装信息：
@@ -194,18 +213,23 @@ codex-feishu 0.1.0
 npm list -g codex-feishu-app-server --depth=0
 ```
 
-进入需要作为默认工作区的项目目录后启动：
+进入需要作为默认工作区的项目目录后执行初始化并启动：
 
 ```bash
 cd /absolute/path/to/project
+codex-feishu init
 codex-feishu
 ```
 
-建议首次启动前确认 Codex CLI 已安装并完成登录：
+初始化会自动选择 Runtime；仅 macOS/Windows 在没有可用 Runtime 时会下载官方资产。没有现有认证时会显示设备码登录地址。无需先安装全局 Codex CLI。可随时检查或管理托管 Runtime：
 
 ```bash
-codex --version
-codex login status
+codex-feishu runtime status
+codex-feishu runtime install
+codex-feishu runtime update
+codex-feishu runtime rollback
+codex-feishu runtime use desktop
+codex-feishu runtime use managed
 ```
 
 更新到最新版本：
@@ -289,6 +313,15 @@ npm install
   },
   "admin": { "enabled": true, "port": 0 },
   "runtime": {
+    "mode": "auto",
+    "executablePath": null,
+    "allowDesktopRuntime": true,
+    "autoDownload": true,
+    "updateChannel": "stable",
+    "autoUpdate": true,
+    "updateCheckIntervalHours": 24,
+    "managedRuntimeDirectory": null,
+    "preferManagedRuntimeOnWindows": true,
     "logLevel": "info",
     "turnDeadlineMs": 3600000,
     "turnInterruptGraceMs": 10000
@@ -315,6 +348,14 @@ npm install
 | `admin.enabled` | `true` | 是否启动本机管理服务 |
 | `admin.port` | `0` | 管理服务端口；`0` 表示随机空闲端口 |
 | `admin.authToken` | 未设置 | 可固定管理 API 令牌；未设置时启动时生成 |
+| `runtime.mode` | `auto` | Runtime 解析模式：`auto`、`configured`、`desktop` 或 `managed` |
+| `runtime.executablePath` | `null` | 显式 Codex Runtime 绝对路径，优先级最高 |
+| `runtime.allowDesktopRuntime` | `true` | 是否扫描 Codex/ChatGPT Desktop 内置 Runtime |
+| `runtime.autoDownload` | `true` | macOS/Windows 没有可用 Runtime 时是否自动下载官方资产；Linux 目前需配置已有 Runtime |
+| `runtime.updateChannel` | `stable` | Managed Runtime 更新通道：`stable` 或 `preview` |
+| `runtime.autoUpdate` | `true` | 是否定期更新 Managed Runtime；不会修改 Desktop Runtime |
+| `runtime.updateCheckIntervalHours` | `24` | Managed Runtime 更新检查间隔 |
+| `runtime.managedRuntimeDirectory` | `null` | 托管目录；`null` 使用当前用户平台默认目录 |
 | `runtime.turnDeadlineMs` | `3600000` | 单个 Turn 最长运行时间；`0` 表示不限制 |
 | `runtime.turnInterruptGraceMs` | `10000` | 软中断后的等待宽限期 |
 | `codex.localDiscoveryEnabled` | `true` | 是否直接只读 Codex 本地数据库发现项目和会话 |
@@ -350,7 +391,7 @@ Windows PowerShell：
 
 ```powershell
 cd C:\absolute\path\to\project
-codex --version
+codex-feishu init
 npx --yes codex-feishu-app-server@latest
 ```
 
@@ -388,7 +429,7 @@ codex-feishu install-service --config /absolute/path/to/config.json
 
 管理页面会从 URL fragment 读取令牌并立即从地址栏移除。`/api/status` 和暂停、恢复、删除定时任务、切换活动 Session 等 `/api/actions/*` 请求都必须携带 `Authorization: Bearer <token>`。状态响应会隐藏 App Secret、Encrypt Key、Verification Token 和管理令牌。
 
-`doctor` 不启动飞书机器人，会依次检查 Node.js 版本、Codex CLI、Codex 登录状态、默认工作区读写权限、SQLite 和飞书凭据配置；任一检查失败时命令返回非零退出码，适合部署前或服务异常时使用。
+`doctor` 不启动飞书机器人，会检查操作系统/架构、Desktop 与 PATH/Managed Runtime 候选、实际选中版本、默认 CODEX_HOME、App Server 握手、Codex 账户、工作区、SQLite 和飞书凭据；任一检查失败时命令返回非零退出码。
 
 ## 飞书命令
 
@@ -414,6 +455,8 @@ codex-feishu install-service --config /absolute/path/to/config.json
 | `/session sync on\|off\|status` | 开关本地会话正文同步和飞书批准路由，仅管理员可用 |
 | `/history [数量]` | 读取当前 Thread 最近完整消息，数量默认 10、最大 50 |
 | `/usage` | 查看 Codex 账号累计 Token、单日峰值和主要额度窗口 |
+| `/runtime` | 查看当前 Runtime 来源、版本、平台、路径和 App Server 状态 |
+| `/account` | 查看当前复用的 Codex/ChatGPT 账户 |
 | `/model` 或 `/model list` | 查看当前模型和 App Server 返回的可用模型 |
 | `/model <模型ID>` / `/model default` | 设置当前会话模型或恢复 Codex 默认值 |
 | `/reasoning <none\|minimal\|low\|medium\|high\|xhigh\|ultra\|default>` | 设置当前会话推理强度 |

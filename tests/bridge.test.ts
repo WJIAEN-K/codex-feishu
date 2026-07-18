@@ -542,6 +542,29 @@ describe("CodexFeishuBridge", () => {
     await bridge.stop();
   });
 
+  it("confirms an approval even when Feishu cannot update the original card", async () => {
+    const { feishu, appServer, sessions, bridge } = await setup();
+    appServer.turnScenario = (threadId, turnId) => [
+      { method: "turn/started", params: { threadId, turn: { id: turnId } } },
+    ];
+    feishu.receive("chat-1", "message-1", "执行高风险操作");
+    await waitFor(() => appServer.calls.some(({ method }) => method === "turn/start"));
+    appServer.emitRequest({
+      id: 906,
+      method: "item/commandExecution/requestApproval",
+      params: { threadId: "thread-1", turnId: "turn-1", command: "dangerous" },
+    });
+    await waitFor(() => feishu.cards.length === 1);
+
+    feishu.failCardUpdates = true;
+    await feishu.click("906", "approve");
+
+    expect(appServer.responses).toContainEqual({ id: 906, result: { decision: "accept" } });
+    await expect(sessions.get("chat-1")).resolves.toMatchObject({ status: "running" });
+    expect(feishu.messages.some(({ text }) => text.includes("✅ 已批准") && text.includes("卡片更新失败"))).toBe(true);
+    await bridge.stop();
+  });
+
   it("only allows the task creator to resolve an approval", async () => {
     const { feishu, appServer, bridge } = await setup();
     appServer.turnScenario = (threadId, turnId) => [

@@ -12,6 +12,8 @@ export function helpCommand(): string {
     "/session sync on|off|status - 同步本地 Codex 会话与批准请求（仅管理员）",
     "/history [数量] - 查看当前 Codex 会话最近消息",
     "/usage - 查看 Codex 账号 Token 与额度使用情况",
+    "/runtime - 查看当前 Codex Runtime 来源和版本",
+    "/account - 查看当前 Codex 账户",
     "/model [模型ID|default] - 查看或切换当前会话模型",
     "/reasoning <强度|default> - 设置当前会话推理强度",
     "/mode default|plan|full-auto - 设置运行与审批模式",

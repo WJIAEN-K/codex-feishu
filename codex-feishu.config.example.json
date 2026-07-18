@@ -55,6 +55,15 @@
     "port": 0
   },
   "runtime": {
+    "mode": "auto",
+    "executablePath": null,
+    "allowDesktopRuntime": true,
+    "autoDownload": true,
+    "updateChannel": "stable",
+    "autoUpdate": true,
+    "updateCheckIntervalHours": 24,
+    "managedRuntimeDirectory": null,
+    "preferManagedRuntimeOnWindows": true,
     "logLevel": "info",
     "turnDeadlineMs": 3600000,
     "turnInterruptGraceMs": 10000

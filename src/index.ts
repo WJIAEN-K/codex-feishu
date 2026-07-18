@@ -13,6 +13,7 @@ import { CommandRouter } from "./commands/index.js";
 import { runSendCommand } from "./commands/send.js";
 import { formatDoctor, runDoctor } from "./commands/doctor.js";
 import { installUserService } from "./commands/install-service.js";
+import { formatResolvedRuntime, runRuntimeCommand } from "./commands/runtime.js";
 import {
   type AppConfig,
   ConfigFile,
@@ -35,6 +36,8 @@ import { LocalCodexSyncService } from "./codex-local/sync-service.js";
 import { LocalApprovalBroker } from "./codex-local/approval-broker.js";
 import { brokerStatePath, runPermissionHook } from "./codex-local/hook-cli.js";
 import { installCodexPermissionHook, uninstallCodexPermissionHook } from "./codex-local/hook-installer.js";
+import { CodexAuthBootstrap, formatAccount } from "./auth/bootstrap.js";
+import { createRuntimeServices } from "./runtime/factory.js";
 
 interface RunningService {
   stop(): Promise<void>;
@@ -42,14 +45,27 @@ interface RunningService {
 
 async function startService(config: AppConfig, configFile: ConfigFile): Promise<RunningService> {
   const logger = new Logger(config.logLevel);
+  const runtimeServices = createRuntimeServices(config);
+  let selectedRuntime = await runtimeServices.manager.resolve();
+  logger.info(`Runtime source: ${selectedRuntime.source}`);
+  logger.info(`Runtime path: ${selectedRuntime.executablePath}`);
+  logger.info(`Runtime version: ${selectedRuntime.version}`);
   const feishu = new FeishuClient(config.feishu);
   const appServerClient = new CodexAppServerClient({
-    command: config.codex.command,
-    args: config.codex.args,
+    command: selectedRuntime.executablePath,
+    args: ["app-server", "--stdio"],
     cwd: config.codex.workingDirectory,
     requestTimeoutMs: config.codex.requestTimeoutMs,
   });
-  const appServer = new CodexAppServerSupervisor(appServerClient);
+  const appServer = new CodexAppServerSupervisor(appServerClient, {
+    runtimeFailureThreshold: 2,
+    recoverRuntime: async () => {
+      runtimeServices.manager.reject(selectedRuntime.executablePath);
+      selectedRuntime = await runtimeServices.manager.resolve();
+      logger.info(`Runtime fallback selected: ${selectedRuntime.source} ${selectedRuntime.version}`);
+      return { command: selectedRuntime.executablePath, args: ["app-server", "--stdio"] };
+    },
+  });
   const sessionStore = new SqliteSessionStore(config.sessionDatabasePath);
   const schedulerStore = config.scheduler.enabled ? new SqliteSchedulerStore(config.sessionDatabasePath) : undefined;
   const attachmentDispatcher = config.attachments.enabled
@@ -60,7 +76,17 @@ async function startService(config: AppConfig, configFile: ConfigFile): Promise<
   let localSync: LocalCodexSyncService | undefined;
   let approvalBroker: LocalApprovalBroker | undefined;
   let bridge: CodexFeishuBridge | undefined;
+  let runtimeUpdateTimer: ReturnType<typeof setInterval> | undefined;
   try {
+    await appServer.start();
+    const auth = await new CodexAuthBootstrap(appServer).ensureAuthenticated({
+      onLoginPrompt: (prompt) => {
+        logger.info(prompt.userCode
+          ? `Codex login required: open ${prompt.url} and enter code ${prompt.userCode}`
+          : `Codex login required: open ${prompt.url}`);
+      },
+    });
+    logger.info(`Account: ${formatAccount(auth.account)}`);
     const attachmentEndpoint = await attachmentServer?.start();
     const workspaceStore = new JsonWorkspaceStore(configFile);
     const workspaces = new WorkspaceRegistry(workspaceStore, {
@@ -99,7 +125,13 @@ async function startService(config: AppConfig, configFile: ConfigFile): Promise<
       (task) => bridge!.enqueueScheduledPrompt(task),
       config.scheduler,
     ) : undefined;
-    const commands = new CommandRouter(sessions, appServer, workspaces, scheduler, localSync);
+    const commands = new CommandRouter(sessions, appServer, workspaces, scheduler, localSync, () => ({
+      source: selectedRuntime.source,
+      version: selectedRuntime.version,
+      executablePath: selectedRuntime.executablePath,
+      platform: process.platform,
+      arch: process.arch,
+    }));
     approvalBroker = localSync ? new LocalApprovalBroker(
       feishu,
       localSync,
@@ -119,9 +151,31 @@ async function startService(config: AppConfig, configFile: ConfigFile): Promise<
       onManagedTurnFinished: (threadId) => localSync?.endManagedTurn(threadId) ?? Promise.resolve(),
     });
     await bridge.start();
+    logger.info("App Server: ready");
     localSync?.start();
     await approvalBroker?.start();
     await scheduler?.start();
+    if (config.runtime.autoUpdate
+      && (selectedRuntime.source === "managed" || selectedRuntime.source === "downloaded")) {
+      runtimeUpdateTimer = setInterval(() => {
+        void runtimeServices.downloader.checkForUpdates(config.runtime.updateChannel).then(async (update) => {
+          if (!update) return;
+          const previousRuntime = selectedRuntime;
+          const installed = await runtimeServices.downloader.installLatest(config.runtime.updateChannel);
+          try {
+            await appServer.switchRuntime(installed.executablePath, ["app-server", "--stdio"]);
+            selectedRuntime = installed;
+            logger.info(`Managed Runtime updated to ${installed.version}`);
+          } catch (error) {
+            const rollback = await runtimeServices.downloader.rollback().catch(() => previousRuntime);
+            await appServer.switchRuntime(rollback.executablePath, ["app-server", "--stdio"]);
+            selectedRuntime = rollback;
+            logger.error("Managed Runtime update failed; rolled back", error);
+          }
+        }).catch((error: unknown) => logger.error("Managed Runtime update check failed", error));
+      }, config.runtime.updateCheckIntervalHours * 60 * 60_000);
+      runtimeUpdateTimer.unref();
+    }
     const adminServer = config.admin.enabled ? new AdminServer({
       port: config.admin.port,
       token: config.admin.authToken ?? randomBytes(24).toString("base64url"),
@@ -163,6 +217,7 @@ async function startService(config: AppConfig, configFile: ConfigFile): Promise<
       async stop() {
         if (stopped) return;
         stopped = true;
+        if (runtimeUpdateTimer) clearInterval(runtimeUpdateTimer);
         try {
           await scheduler?.stop();
           localSync?.stop();
@@ -182,9 +237,11 @@ async function startService(config: AppConfig, configFile: ConfigFile): Promise<
     };
   } catch (error) {
     attachmentDispatcher?.revokeAll();
+    if (runtimeUpdateTimer) clearInterval(runtimeUpdateTimer);
     localSync?.stop();
     await approvalBroker?.stop().catch(() => {});
     await bridge?.stop().catch(() => {});
+    await appServer.stop().catch(() => {});
     await attachmentServer?.stop().catch(() => {});
     sessionStore.close();
     schedulerStore?.close();
@@ -228,6 +285,35 @@ async function main(): Promise<void> {
     const checks = await runDoctor(await configFile.load());
     console.log(formatDoctor(checks));
     if (checks.some((check) => !check.ok)) process.exitCode = 1;
+    return;
+  }
+  if (args[0] === "runtime") {
+    const config = await configFile.load();
+    console.log(await runRuntimeCommand(configFile, config, args.slice(1)));
+    return;
+  }
+  if (args[0] === "init") {
+    const config = await ensureJsonConfig(configFile);
+    const runtime = await createRuntimeServices(config).manager.resolve();
+    console.log(formatResolvedRuntime(runtime));
+    const client = new CodexAppServerClient({
+      command: runtime.executablePath,
+      args: ["app-server", "--stdio"],
+      cwd: config.codex.workingDirectory,
+      requestTimeoutMs: config.codex.requestTimeoutMs,
+    });
+    try {
+      await client.start();
+      const account = await new CodexAuthBootstrap(client).ensureAuthenticated({
+        onLoginPrompt: (prompt) => console.log(prompt.userCode
+          ? `请打开 ${prompt.url} 并输入验证码 ${prompt.userCode}`
+          : `请打开 ${prompt.url} 完成登录`),
+      });
+      console.log(`Codex 账户：${formatAccount(account.account)}`);
+      console.log("初始化完成");
+    } finally {
+      await client.stop().catch(() => undefined);
+    }
     return;
   }
   if (args[0] === "install-service") {

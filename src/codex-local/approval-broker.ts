@@ -132,10 +132,20 @@ export class LocalApprovalBroker {
       if (!pending.messageId) settle(null);
       const approved = await result;
       if (pending.messageId) {
-        await this.feishu.updateCard(pending.messageId, localApprovalResolvedCard({
-          toolName: input.tool_name,
-          detail,
-        }, approved)).catch((error: unknown) => this.logger.warn("Unable to update local approval card", error));
+        try {
+          await this.feishu.updateCard(pending.messageId, localApprovalResolvedCard({
+            toolName: input.tool_name,
+            detail,
+          }, approved));
+        } catch (error) {
+          this.logger.warn("Unable to update local approval card", error);
+          const label = approved === true ? "✅ 已批准" : approved === false ? "❌ 已拒绝" : "↩️ 已转到 Codex 本地处理";
+          await this.feishu.sendMessage(
+            pending.chatId,
+            `${label}（卡片更新失败，结果已生效）`,
+            pending.messageId,
+          ).catch((sendError: unknown) => this.logger.warn("Unable to send local approval resolution fallback", sendError));
+        }
       }
       return approved;
     } finally {

@@ -10,7 +10,7 @@ const context = { chatId: "chat-1", senderOpenId: "ou-user", chatType: "p2p" as 
 
 function setup(admin = false) {
   let turn = 0;
-  const request = vi.fn(async (method: string) => {
+  const request = vi.fn(async (method: string, _params?: unknown) => {
     if (method === "thread/start") return { thread: { id: "thread-1" } };
     if (method === "thread/resume") return {};
     if (method === "turn/interrupt") return {};
@@ -36,6 +36,10 @@ function setup(admin = false) {
       }],
       nextCursor: null,
     };
+    if (method === "account/read") return {
+      account: { type: "chatgpt", email: "demo@example.com", planType: "plus" },
+      requiresOpenaiAuth: true,
+    };
     throw new Error(`Unexpected method ${method}`);
   });
   const manager = new SessionManager(
@@ -44,7 +48,27 @@ function setup(admin = false) {
     { cwd: "/workspace" },
   );
   const workspaces = { isAdmin: () => admin } as unknown as WorkspaceRegistry;
-  return { request, manager, router: new CommandRouter(manager, { getStatus: () => "ready" }, workspaces) };
+  return {
+    request,
+    manager,
+    router: new CommandRouter(
+      manager,
+      {
+        getStatus: () => "ready",
+        request: <T>(method: string, params?: unknown) => request(method, params) as Promise<T>,
+      },
+      workspaces,
+      undefined,
+      undefined,
+      () => ({
+        source: "desktop-bundled",
+        version: "0.144.4",
+        executablePath: "/Applications/Codex.app/Contents/Resources/codex",
+        platform: "darwin",
+        arch: "arm64",
+      }),
+    ),
+  };
 }
 
 describe("runtime controls", () => {
@@ -104,5 +128,11 @@ describe("runtime controls", () => {
       threadId: running.threadId,
       turnId: running.activeTurnId,
     });
+  });
+
+  it("reports the selected Runtime and reused Codex account", async () => {
+    const { router } = setup();
+    await expect(router.execute(context, "/runtime")).resolves.toContain("桌面客户端");
+    await expect(router.execute(context, "/account")).resolves.toContain("demo@example.com");
   });
 });

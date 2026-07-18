@@ -593,12 +593,6 @@ export class CodexFeishuBridge {
       pending.request.requestId,
       buildInteractiveResponse(pending.request, resolution, pending.answers),
     );
-    if (updateCard && pending.messageId) {
-      await this.feishu.updateCard(
-        pending.messageId,
-        interactiveResolvedCard(pending.request, resolution, pending.answers),
-      );
-    }
     const runtime = this.runtimes.get(pending.conversationId);
     await this.sessions.updateStatus(
       pending.conversationId,
@@ -606,6 +600,21 @@ export class CodexFeishuBridge {
       pending.request.turnId ?? runtime?.turnId,
       pending.request.threadId,
     );
+    if (updateCard && pending.messageId) {
+      try {
+        await this.feishu.updateCard(
+          pending.messageId,
+          interactiveResolvedCard(pending.request, resolution, pending.answers),
+        );
+      } catch (error) {
+        this.logger.warn("Unable to update resolved interactive card", error);
+        await this.feishu.sendMessage(
+          pending.chatId,
+          `${interactiveResolutionLabel(pending.request, resolution)}（卡片更新失败，审批结果已生效）`,
+          pending.messageId,
+        ).catch((sendError: unknown) => this.logger.warn("Unable to send interactive resolution fallback", sendError));
+      }
+    }
   }
 
   private declineAllPending(reason: "shutdown" | "failure"): void {
@@ -808,6 +817,13 @@ function resourceLabel(type: InboundResource["type"]): string {
 
 function interactiveKey(id: JsonRpcId): string {
   return String(id);
+}
+
+function interactiveResolutionLabel(request: InteractiveRequest, resolution: InteractiveResolution): string {
+  if (resolution === "accept") {
+    return request.kind === "approval" || request.kind === "permission_approval" ? "✅ 已批准" : "✅ 已提交";
+  }
+  return resolution === "decline" ? "❌ 已拒绝" : "⏱️ 已取消";
 }
 
 function conversationIdentity(

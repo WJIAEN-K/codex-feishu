@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import type { FeishuConfig, BridgeStatus } from "../types.js";
 import type {
   CardActionHandler,
+  FeishuCardAction,
   FeishuPort,
   InboundResource,
   MessageHandler,
@@ -174,14 +175,22 @@ export class FeishuClient implements FeishuPort {
             && typeof operatorOpenId === "string"
             && operatorOpenId.length > 0
           ) {
-            await this.onCardActionCallback({
+            const cardAction: FeishuCardAction = {
               action,
               requestId,
               operatorOpenId,
               messageId: data?.context?.open_message_id ?? data?.open_message_id,
               ...(typeof value?.questionId === "string" ? { questionId: value.questionId } : {}),
               ...(typeof value?.answer === "string" ? { answer: value.answer } : {}),
+            };
+            // Feishu restores the original card if its callback response arrives after a
+            // message PATCH. Acknowledge the interaction first, then update the message.
+            setImmediate(() => {
+              void Promise.resolve(this.onCardActionCallback?.(cardAction)).catch((error: unknown) => {
+                _warn("Card action handling failed:", error instanceof Error ? error.message : error);
+              });
             });
+            return { toast: { type: "info", content: "正在处理审批…" } };
           }
           return {};
         },

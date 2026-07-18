@@ -12,16 +12,32 @@ import type { TaskScheduler } from "../scheduler/service.js";
 import { timerCommand } from "./timer.js";
 import { cronCommand } from "./cron.js";
 import type { LocalCodexSyncService } from "../codex-local/sync-service.js";
+import { formatAccount } from "../auth/bootstrap.js";
+import type { GetAccountResponse } from "../app-server/generated/v2/GetAccountResponse.js";
+
+export interface RuntimeStatusView {
+  source: string;
+  version: string;
+  executablePath: string;
+  platform: NodeJS.Platform;
+  arch: NodeJS.Architecture;
+}
+
+interface CommandAppServer {
+  getStatus(): ReturnType<CodexAppServerClient["getStatus"]>;
+  request?<T>(method: string, params?: unknown): Promise<T>;
+}
 
 export class CommandRouter {
   private readonly recentThreads = new Map<string, ThreadSummary[]>();
 
   constructor(
     private readonly sessions: SessionManager,
-    private readonly appServer: Pick<CodexAppServerClient, "getStatus">,
+    private readonly appServer: CommandAppServer,
     private readonly workspaces: WorkspaceRegistry,
     private readonly scheduler?: TaskScheduler,
     private readonly localSync?: LocalCodexSyncService,
+    private readonly runtimeStatus?: () => RuntimeStatusView,
   ) {}
 
   isCommand(text: string): boolean {
@@ -60,6 +76,8 @@ export class CommandRouter {
         "usage",
         this.localSync,
       );
+      case "/runtime": return this.runtimeCommand();
+      case "/account": return this.accountCommand();
       case "/model": return this.modelCommand(context, argumentsText);
       case "/reasoning": return this.reasoningCommand(context, argumentsText);
       case "/mode": return this.modeCommand(context, argumentsText);
@@ -68,6 +86,33 @@ export class CommandRouter {
       case "/help": return helpCommand();
       default: return `未知命令：${command ?? text}\n\n${helpCommand()}`;
     }
+  }
+
+  private runtimeCommand(): string {
+    if (!this.runtimeStatus) return "Codex Runtime 状态不可用";
+    const runtime = this.runtimeStatus();
+    const source = {
+      configured: "显式配置",
+      path: "系统 PATH",
+      "desktop-bundled": "桌面客户端",
+      managed: "托管 Runtime",
+      downloaded: "自动下载",
+    }[runtime.source] ?? runtime.source;
+    return [
+      "Codex Runtime",
+      "",
+      `来源：${source}`,
+      `版本：${runtime.version}`,
+      `平台：${runtime.platform} ${runtime.arch}`,
+      `App Server：${this.appServer.getStatus() === "ready" ? "已连接" : this.appServer.getStatus()}`,
+      `路径：${runtime.executablePath}`,
+    ].join("\n");
+  }
+
+  private async accountCommand(): Promise<string> {
+    if (!this.appServer.request) return "Codex 账户状态不可用";
+    const result = await this.appServer.request<GetAccountResponse>("account/read", { refreshToken: false });
+    return `Codex 账户：${formatAccount(result.account)}`;
   }
 
   private async modelCommand(context: CommandContext, argumentsText: string): Promise<string> {
